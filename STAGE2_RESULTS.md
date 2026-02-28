@@ -162,21 +162,29 @@ Norms nearly doubled (83 → 152), moving toward text embedding range (~240). Th
 2. **Complete per-sample discrimination** — some sample pairs produce identical output (1000/2000)
 3. **Exact norm matching** — norms at 152 vs text embeddings at ~240 (still a gap)
 
-### Why This Is Sufficient for Stage 3
+### Decision: Extend to 15,000 Steps
 
-Stage 2's goal was never perfect ASR. It was to teach Gemma+LoRA to **extract meaningful information from audio tokens**. The ablation tests prove this is working:
-- The model treats audio tokens as informative prefix conditioning (not noise)
-- LoRA has adapted Gemma's attention patterns to process audio token distributions
-- The projector outputs are in a distribution Gemma can work with
+Despite passing all go/no-go criteria, the per-sample discrimination was deemed insufficient for Stage 3:
+- Samples 1000/2000 produced identical greedy decode output
+- Audio token norms at 152, still far from text range (~240)
+- Loss was still decreasing (not saturated) — more training likely helps
+- Risk: Stage 3 takes ~7-8 hours. If audio representations aren't discriminative enough, that time is wasted.
 
-Stage 3 will provide the **task-specific gradient signal** (flow matching loss for robot actions) that teaches the system to map audio content to correct behavior. The audio processing infrastructure from Stage 2 is the foundation Stage 3 builds on.
+**Extended training**: 7,500 → 15,000 steps (resumed from step 7499 with `--resume`)
+- Additional cost: ~73 minutes (7500 × 0.59s)
+- DROID epochs at 15k: 3.6 (acceptable with 10 voices)
+- LibriSpeech epochs at 15k: 1.2 (still low)
+- LR schedule updated: cosine decay over 15k steps
 
 ---
 
-## 5. Stage 3 Readiness
+## 5. Extended Training (Steps 7500–15000)
 
-- **Checkpoint**: `checkpoints/pi05_audio_mixed_asr/mixed_asr/7499/params`
-- **Stage 3 weight_loader**: Updated to `./checkpoints/pi05_audio_mixed_asr/mixed_asr/7499/params` *(note: config defaults to 7500, need to update to 7499)*
+*Results to be added after training completes.*
+
+- **Resumed from**: step 7499 checkpoint
+- **tmux**: `mixed_asr`, **log**: `logs/stage2_mixed_asr_15k.log`
+- **Stage 3 weight_loader**: Updated to `./checkpoints/pi05_audio_mixed_asr/mixed_asr/14999/params`
 - **Config**: `pi05_audio_stage3_libero` — ready
 - **TTS data**: LIBERO train (2,240 files), LIBERO eval (1,120 files) — ready
-- **Estimated time**: ~7-8 hours (30k steps × ~0.8-1.0 s/step)
+- **Estimated Stage 3 time**: ~7-8 hours (30k steps × ~0.8-1.0 s/step)

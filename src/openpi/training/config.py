@@ -907,11 +907,11 @@ _CONFIGS = [
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=500,
             peak_lr=2e-5,
-            decay_steps=7_500,
+            decay_steps=15_000,
             decay_lr=2e-6,
         ),
         ema_decay=None,
-        num_train_steps=7_500,
+        num_train_steps=15_000,
         batch_size=32,
         save_interval=500,
         log_interval=50,
@@ -938,7 +938,7 @@ _CONFIGS = [
         # Default assumes Stage 2 ran with config=pi05_audio_mixed_asr, exp_name=mixed_asr.
         # Override at launch: --weight-loader.params-path=./checkpoints/.../params
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "./checkpoints/pi05_audio_mixed_asr/mixed_asr/7499/params"
+            "./checkpoints/pi05_audio_mixed_asr/mixed_asr/14999/params"
         ),
         # Freeze SigLIP + LLM base weights + Whisper + audio projector.
         # Trainable: Gemma LoRA + action expert LoRA + action head projections.
@@ -994,7 +994,7 @@ _CONFIGS = [
         # Default assumes Stage 2 ran with config=pi05_audio_mixed_asr, exp_name=mixed_asr.
         # Override at launch: --weight-loader.params-path=./checkpoints/.../params
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "./checkpoints/pi05_audio_mixed_asr/mixed_asr/7499/params"
+            "./checkpoints/pi05_audio_mixed_asr/mixed_asr/14999/params"
         ),
         # Freeze SigLIP + LLM base weights + Whisper.
         # Trainable: Gemma LoRA + action expert LoRA + action head + audio projector.
