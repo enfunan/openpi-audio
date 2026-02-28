@@ -562,6 +562,11 @@ class TrainConfig:
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
 
+    # Per-parameter LR scaling. Maps a filter (matching trainable param paths) to a
+    # scale factor applied to the base LR. E.g., to train audio_projector at 10x lower
+    # LR: {PathRegex(".*audio_projector.*"): 0.1}. Unmatched params use scale 1.0.
+    lr_scale_overrides: tyro.conf.Suppress[dict[Filter, float]] = dataclasses.field(default_factory=dict)
+
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
 
@@ -780,6 +785,54 @@ _CONFIGS = [
         wandb_enabled=True,
         exp_name="stage2_asr_finetune",
     ),
+    # Joint ASR training: skip Stage 1 entirely. Fresh random projector (output_scale=2.4)
+    # + LoRA on Gemma, trained jointly with ASR CE loss from the start.
+    # Loads base Pi0.5 checkpoint + pretrained Whisper weights.
+    # LoRA gives Gemma flexibility to process new audio projector tokens.
+    # Uses train-clean-360 for more data diversity.
+    TrainConfig(
+        name="pi05_audio_joint_asr",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            audio_enabled=True,
+            training_stage="asr_alignment",
+            paligemma_variant="gemma_2b_lora",
+            discrete_state_input=False,
+        ),
+        data=LibriSpeechDataConfig(
+            data_dir="",  # Override via --data.data_dir /path/to/librispeech/train-clean-360
+        ),
+        # Load base checkpoint + Whisper weights. Fresh projector + LoRA from model init.
+        weight_loader=weight_loaders.CompositeWeightLoader(
+            loaders=(
+                weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+                weight_loaders.WhisperWeightLoader(),
+            ),
+        ),
+        # Freeze Gemma + action expert base weights, SigLIP, Whisper.
+        # Trainable: Gemma LoRA adapters + audio projector (fresh random init).
+        freeze_filter=nnx.Any(
+            nnx_utils.PathRegex(".*PaliGemma/img.*"),
+            nnx.All(
+                nnx_utils.PathRegex(".*llm.*"),
+                nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+            ),
+            nnx_utils.PathRegex(".*whisper_encoder.*"),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2e-5,
+            decay_steps=15_000,
+            decay_lr=2e-6,
+        ),
+        ema_decay=None,
+        num_train_steps=15_000,
+        batch_size=32,
+        save_interval=500,
+        log_interval=50,
+        wandb_enabled=True,
+        exp_name="joint_asr",
+    ),
     # Stage 3: Robot task training with LoRA + audio/text mixing (60/40).
     # Loads Stage 2 checkpoint (Gemma LoRA adapted to audio).
     # Trainable: Gemma LoRA + action expert LoRA + action head projections.
@@ -826,9 +879,13 @@ _CONFIGS = [
         policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
     ),
     # Stage 3: LIBERO robot task training with LoRA + audio/text mixing (60/40).
-    # Loads Stage 2 checkpoint (Gemma LoRA adapted to audio).
-    # Trainable: Gemma LoRA + action expert LoRA + action head projections.
-    # Frozen: audio projector (preserves learned embedding distribution).
+    # Loads Stage 2 checkpoint (Gemma LoRA + audio projector adapted to audio).
+    # Trainable: Gemma LoRA + action expert LoRA + action head + audio projector (low LR).
+    # Frozen: Gemma base weights + Whisper encoder + SigLIP.
+    # Audio projector trainable at 10x lower LR (0.1 scale) to allow adaptation
+    # without destabilizing Stage 2 representations.
+    # Audio and text are mutually exclusive: when TTS audio is assigned, text prompt
+    # is removed, forcing the model to use audio for task understanding (VLAS design).
     # Set --data.tts_cache_dir and --data.audio_ratio at runtime.
     TrainConfig(
         name="pi05_audio_stage3_libero",
@@ -847,10 +904,10 @@ _CONFIGS = [
             extra_delta_transform=False,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "./checkpoints/pi05_audio_stage2_asr_finetune/stage2_asr_finetune/latest/params"
+            "./checkpoints/pi05_audio_joint_asr/joint_asr/latest/params"
         ),
-        # Freeze SigLIP + LLM base weights + Whisper + audio projector.
-        # Trainable: Gemma LoRA + action expert LoRA + action head projections.
+        # Freeze SigLIP + LLM base weights + Whisper.
+        # Trainable: Gemma LoRA + action expert LoRA + action head + audio projector.
         freeze_filter=nnx.Any(
             nnx_utils.PathRegex(".*PaliGemma/img.*"),
             nnx.All(
@@ -858,8 +915,11 @@ _CONFIGS = [
                 nnx.Not(nnx_utils.PathRegex(".*lora.*")),
             ),
             nnx_utils.PathRegex(".*whisper_encoder.*"),
-            nnx_utils.PathRegex(".*audio_projector.*"),
         ),
+        # Audio projector gets 10x lower LR than LoRA/action head.
+        lr_scale_overrides={
+            nnx_utils.PathRegex(".*audio_projector.*"): 0.1,
+        },
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=2e-5,

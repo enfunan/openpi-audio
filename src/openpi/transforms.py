@@ -393,6 +393,11 @@ class AudioTextMixingTransform(DataTransformFn):
 
     With probability `audio_ratio`, looks up a pre-synthesized TTS audio file
     for the current prompt from a manifest and injects it as `audio_path`.
+    When audio is assigned, the text prompt is REMOVED (set to empty string)
+    so the model must rely on audio alone for task understanding. This follows
+    VLAS (Section 3.2): "randomly replaced half of the training samples with
+    the synthesized speech instructions" — audio and text are mutually exclusive.
+
     Otherwise, the sample is left as text-only (no audio_path), so that
     AudioPreprocess will produce a zero tensor with audio_mask=False.
     """
@@ -442,6 +447,11 @@ class AudioTextMixingTransform(DataTransformFn):
                 audio_files = manifest.get(prompt)
                 if audio_files:
                     data["audio_path"] = rng.choice(audio_files)
+                    # Remove text prompt so model must use audio for task info.
+                    # Set to empty string (not None) to avoid downstream errors
+                    # in TokenizePrompt. The tokenizer will produce BOS + padding,
+                    # giving the model no text instruction to fall back on.
+                    data["prompt"] = np.asarray("")
         return data
 
 

@@ -195,7 +195,70 @@ Stage 1 learned a coarse distribution match. Stage 2's ASR cross-entropy loss pr
 - Step 400: loss=6.61 (continuing to drop)
 - Speed: ~1.7 it/s, ETA ~1h 36m for 10k steps
 
-## 6. Stage 3: Robot Task Training — The Hardest Design Decision
+## 6. Critical Bug: Audio/Text Mutual Exclusivity
+
+### The Bug
+
+Our `AudioTextMixingTransform` (used in Stage 3 for 60/40 audio/text mixing) had a critical bug: when assigning TTS audio to a training sample, it added `audio_path` to the data dict but **did not remove the text prompt**. This meant:
+
+- Audio samples had BOTH `audio_path` AND the full text prompt
+- The model could simply ignore audio and use text for task understanding
+- Audio would never be learned because it was always redundant
+
+### How We Discovered It
+
+Analysis of VLAS (Section 3.2) revealed their design: "randomly replaced half of the training samples with the synthesized speech instructions." In VLAS code, when audio is assigned, the text instruction is literally replaced with a single `<audio>` token — the model receives **either** audio **or** text, never both.
+
+### The Fix
+
+In `src/openpi/transforms.py`, when audio is assigned:
+```python
+data["audio_path"] = rng.choice(audio_files)
+# Remove text prompt so model must use audio for task info.
+data["prompt"] = np.asarray("")
+```
+
+Empty string (not `None`) avoids downstream `ValueError("Prompt is required")` in `TokenizePrompt`. The tokenizer produces BOS + padding tokens, giving the model zero text information to fall back on.
+
+**Verified**: `scripts/check_audio_text_mixing.py` runs 100 samples and confirms:
+- All audio samples: `prompt=""`, `audio_path` present
+- All text samples: original prompt preserved, no `audio_path`
+
+### Why This Is Critical
+
+Without this fix, Stage 3 training would appear to succeed (loss decreases, actions look reasonable) but the model would be using **text** for all conditioning. At inference time with audio-only input, the model would have never learned to extract task information from audio tokens — it would produce random or default actions.
+
+## 7. Training Data Strategy: LibriSpeech + DROID TTS
+
+### The Problem
+
+Stage 2 trains on LibriSpeech (generic speech), but Stage 3 uses robot manipulation commands. There's a vocabulary domain gap: LibriSpeech contains "the old man walked down the street" while robot tasks say "pick up the red mug and place it on the plate." If the projector only sees general speech, it may not transfer well to robot-specific vocabulary.
+
+### DROID Dataset Analysis
+
+Pi0.5 was trained on DROID (among other datasets). We downloaded the DROID annotations file (`/home/user1/workspace/VLA/data/droid_annotations.json`, 50,092 episodes):
+- 3 language annotation slots per episode
+- 31,420 unique instructions in slot 1
+- 64,608 unique instructions across all 3 slots
+- 2,694 unique vocabulary words
+- Top verbs: put (13.9k), pick (10.4k), move (9.4k), remove (6.6k), take (4.3k)
+- 92% vocabulary overlap with LIBERO — ideal training data for domain adaptation
+
+### Mixing Strategy: 25% LibriSpeech / 75% DROID
+
+We decided on a mixed dataset for Stage 2:
+- **25% LibriSpeech train-clean-360**: 859 real speakers provide acoustic diversity (accents, speaking styles, noise). Avg 34.5 words/utterance, ~12.5s duration, ~45 tokens/sample
+- **75% DROID TTS**: 31,420 unique robot manipulation instructions × 10 TTS voices = 314,000 samples. Avg 10.8 words, ~3.7s duration, ~14 tokens/sample
+
+**Why 25/75 by sample count?** LibriSpeech utterances are ~3.4x longer than DROID commands. At 25/75 sample ratio, the **token exposure** is roughly balanced: 25% × 45 tokens ≈ 75% × 14 tokens. This ensures the model spends equal learning time on acoustic diversity and domain-relevant vocabulary.
+
+### TTS Voice Plan
+
+- **DROID**: 10 voices (5 male, 5 female) — enough diversity for 314k samples without excessive synthesis time (~13 hours)
+- **LIBERO**: 20 voices (10 male, 10 female) — more voices for only 130 unique instructions × 20 = 2,600 samples (30 min synthesis)
+- **Engine**: edge-tts (Microsoft Azure, free, 60+ English voices with varied accents)
+
+## 8. Stage 3: Robot Task Training — The Hardest Design Decision
 
 ### Pi0.5's Two-Expert Architecture
 
@@ -211,69 +274,127 @@ Shared attention: Action expert's queries attend to Gemma's keys/values
 
 In the shared attention layers, Q/K/V matrices from both experts are concatenated. The action expert reads Gemma's representations through cross-attention in this shared space.
 
-### The Three Options We Considered
+### Evolution of Our Freezing Strategy
 
-**Option A: Only train action side**
+We went through three iterations of the Stage 3 freezing strategy:
+
+**Option A: Only train action side** (rejected)
 - Train: action expert LoRA + action head projections
 - Freeze: everything else including Gemma LoRA from Stage 2
+- Problem: Gemma LoRA optimized for ASR can't adapt K/V for robot conditioning
 
-Problem: The Gemma LoRA from Stage 2 was optimized for ASR (predict text from audio). Robot conditioning needs different K/V representations in the shared attention — specifically, representations that help the action expert predict motor commands, not transcriptions. Frozen Gemma LoRA can't adapt.
-
-**Option B: Gemma LoRA + action side, freeze audio projector** (CHOSEN)
+**Option B: Gemma LoRA + action side, freeze audio projector** (initially chosen)
 - Train: Gemma LoRA + action expert LoRA + action head projections
 - Freeze: audio projector, all base weights, SigLIP, Whisper
+- Rationale: projector produces correct distribution, flow matching gradients would corrupt it
 
-This lets Gemma LoRA adapt its K/V representations from "good for ASR" to "good for robot conditioning." The audio projector stays frozen because it's already producing the right distribution — flow matching gradients would corrupt it.
+**Option C: Everything trainable, projector at lower LR** (FINAL — approved)
+- Train: Gemma LoRA + action expert LoRA + action head + audio projector (at 10x lower LR)
+- Freeze: Gemma base weights + Whisper encoder + SigLIP
+- Rationale: ASR-optimized representations may not be optimal for action prediction. Allowing the projector to adapt slowly preserves Stage 2 quality while enabling robot-specific tuning.
 
-**Option C: Everything trainable**
-- Train: all LoRA + projector + action head
+### Why We Changed from Option B to Option C
 
-Problem: Flow matching loss optimizes for action prediction, not audio understanding. The audio projector would drift from the carefully learned text embedding distribution, potentially breaking the audio-to-embedding mapping entirely.
+The argument for freezing the projector (Option B) assumed that the ASR-optimized embedding distribution is exactly what Stage 3 needs. But upon reflection:
 
-### Why Freeze the Audio Projector in Stage 3?
+1. **ASR ≠ action conditioning**: The projector learned to encode speech content for text prediction. Robot action prediction may benefit from slightly different emphasis (e.g., emphasizing object names vs verbs differently).
+2. **Gemma LoRA can't compensate for everything**: If the projector's representations are suboptimal for robot conditioning, Gemma LoRA would need to learn a complex remapping. It's more efficient to let the projector adapt slightly.
+3. **10x lower LR is safe**: At 2e-6 effective LR (vs 2e-5 for LoRA), the projector moves ~100x slower than LoRA in weight-space. Over 30k steps, it fine-tunes rather than retrains.
 
-This deserves its own section because it's counterintuitive. You might think: "more trainable parameters = better, let the projector adapt to robot tasks."
+### Per-Parameter LR Scaling: Implementation
 
-The audio projector was specifically trained (Stage 1 + Stage 2) to output tokens in Gemma's expected embedding distribution. It learned:
-- The right norm range (~40-60, matching text embeddings)
-- Directions that encode speech content in Gemma's embedding space
-- A mapping that Gemma LoRA (from Stage 2) knows how to decode
+We implemented per-parameter LR groups via **gradient scaling** — the simplest possible approach:
 
-Flow matching loss in Stage 3 has a completely different objective: minimize the difference between predicted and ground-truth robot actions. The gradient to the audio projector from this loss says "change your output so the action expert can better predict motor commands" — this is a very different pressure than "match text embedding distribution." Over thousands of steps, this would push the projector to output tokens optimized for flow matching but no longer interpretable by Gemma's attention layers.
+```python
+# In train_step (scripts/train.py):
+for filt, scale in config.lr_scale_overrides.items():
+    grads = nnx_utils.state_map(grads, filt, lambda p: p.replace(p.value * scale))
+```
 
-Instead, we let Gemma LoRA adapt. It can learn to transform audio projector outputs into K/V representations useful for robot conditioning, without disrupting the projector's learned audio encoding.
+Scaling gradients by 0.1 before the optimizer is mathematically equivalent to using 10x lower learning rate for those parameters (since `update = -lr * grad`, scaling grad by 0.1 gives `update = -lr * 0.1 * grad = -(0.1*lr) * grad`).
+
+This approach was chosen over:
+- `optax.multi_transform`: Requires building parameter label pytrees that are incompatible with NNX State's `VariableState` leaves
+- `optax.masked`: Doesn't support different scales per group, only on/off
+- Per-parameter optimizer chains: Excessive complexity for a single scale factor
+
+The `lr_scale_overrides` field on `TrainConfig` maps filters to scale factors:
+```python
+lr_scale_overrides={
+    nnx_utils.PathRegex(".*audio_projector.*"): 0.1,  # 10x lower LR
+}
+```
+
+### LIBERO Visual Ambiguity: Why Audio Can't Be Ignored
+
+A key concern was whether the model would learn to ignore audio in Stage 3 because images alone provide enough information. Analysis of LIBERO's 130 tasks across 5 suites showed:
+
+| Suite | Tasks | Scenes | Tasks sharing a scene | Ambiguity |
+|-------|-------|--------|----------------------|-----------|
+| libero_spatial | 10 | 1 | 10/10 (all same scene) | VERY HIGH — same objects, different target locations |
+| libero_object | 10 | 1 | 10/10 (all same scene) | VERY HIGH — same scene, different target objects |
+| libero_90 | 90 | 20 | 84/90 (18 scenes have 3+ tasks) | HIGH — most scenes shared |
+| libero_10 | 10 | 9 | 2/10 | MODERATE |
+| libero_goal | 10 | 10 | 0/10 (unique scenes) | LOW — each task has unique scene |
+
+**Result: 120 out of 130 tasks (92%) share their scene with at least one other task.** For these tasks, the visual input alone is ambiguous — the model MUST use the instruction (audio or text) to know which task to perform. This makes the F6 failure mode (model ignores audio) much less likely when training on all 130 LIBERO tasks.
 
 ### 60/40 Audio/Text Mixing
 
-Stage 3 uses 60% TTS audio and 40% text-only instruction mixing. Why?
+Stage 3 uses 60% TTS audio and 40% text-only instruction mixing (following VLAS's `random.random() > 0.4`):
 
-- **60% audio**: Enough exposure to audio-conditioned training that the model learns to map audio → robot actions
-- **40% text**: Preserves the original text instruction capability and provides a regularization signal — text instructions are "clean" conditioning (no TTS artifacts, no speaker variation), which helps stabilize training
-- **Why not 100% audio?**: The model would lose the ability to follow text instructions, and TTS audio is synthesized (not real speech), so it has limited acoustic diversity
+- **60% audio**: Enough exposure that the model learns to map audio → robot actions
+- **40% text**: Preserves original text instruction capability and provides regularization
+- **Mutual exclusivity**: When audio is assigned, text prompt is removed (see Section 6). The model receives either audio+images or text+images, never both.
+- **Why not 100% audio?**: Would lose text instruction capability, and TTS has limited acoustic diversity
 
 ### TTS Pre-Synthesis
 
 We pre-synthesize TTS audio for all robot task prompts rather than generating on-the-fly because:
 - Deterministic training (same audio per prompt per epoch)
 - No runtime dependency on TTS service
-- Can use 50+ diverse voices for speaker variation
+- Can use diverse voices for speaker variation (20 voices for LIBERO)
 - Cached in a manifest (prompt_text → list of audio file paths) for fast lookup
 
-## 7. What Could Go Wrong (Known Risks)
+## 9. What Could Go Wrong (Known Risks and Failure Mode Plan)
+
+### F1: Stage 2 loss doesn't decrease (projector fundamentally broken)
+- **Detection**: Loss stuck above 8.0 after 2000 steps
+- **Recovery**: Try joint ASR (skip Stage 1, train projector + LoRA from scratch). Config `pi05_audio_joint_asr` is already prepared.
+
+### F2: Stage 2 greedy decode shows no variation (projector still collapsed)
+- **Detection**: `scripts/diag_decode.py` shows identical output for all samples
+- **Recovery**: Increase LoRA rank to 32 or 64. If still collapsed, switch to joint ASR approach.
+
+### F3: Stage 3 loss doesn't decrease (audio/action bridging fails)
+- **Detection**: Loss flat after 5k steps compared to text-only baseline
+- **Recovery**: Try higher audio_ratio (80/20), or larger action expert LoRA rank
+
+### F4: Stage 3 audio performance poor but text fine (audio not learned)
+- **Detection**: Eval with `--eval-mode audio` significantly worse than `--eval-mode text`
+- **Recovery**: Check if AudioTextMixingTransform bug has resurfaced. Try 80/20 mixing. Verify TTS audio quality.
+
+### F5: Stage 3 text performance degrades (catastrophic forgetting)
+- **Detection**: Eval with `--eval-mode text` worse than pre-Stage-3 baseline
+- **Recovery**: Lower audio_ratio to 40/60. Increase LoRA rank for more capacity.
+
+### F6: Model ignores audio entirely (uses images only)
+- **Detection**: Identical actions for same scene with different audio instructions
+- **Likelihood**: LOW — 92% of LIBERO tasks share scenes, making instruction essential
+- **Recovery**: Verify mutual exclusivity in transforms. Add audio-perturbation test (swap audio between samples, actions should change).
+
+### F7: TTS vs real speech domain gap at inference
+- **Detection**: Good performance with TTS audio, poor with real speech recordings
+- **Recovery**: Add audio augmentation (noise injection, room reverb). Fine-tune on small set of real recordings.
+
+### F8: Projector destabilized by Stage 3 gradients (despite low LR)
+- **Detection**: Audio token norms diverge from text embedding norms during Stage 3
+- **Recovery**: Freeze projector entirely (revert to Option B). Or reduce scale from 0.1 to 0.01.
 
 ### Stage 1 v2 plateau and collapse
 Stage 1 v2 MSE plateaued at ~0.21 and the projector collapsed to a single direction. This was mitigated by adding a learnable output scale (2.4x) and proceeding to Stage 2 where ASR CE provides per-sample discrimination. **Status: mitigated, Stage 2 in progress.**
 
-### Stage 2 LoRA rank might be too low
-Rank 16 might not have enough capacity for Gemma to learn audio → text decoding. If Stage 2 ASR quality is poor, try rank 32 or 64. The tradeoff is more parameters to train and higher risk of overfitting.
-
-### Stage 3 audio/text mixing ratio
-60/40 is our starting point. If audio performance is poor, try 80/20. If text performance degrades, try 50/50. This is an empirical hyperparameter.
-
-### TTS vs real speech gap
-Stage 3 uses synthesized TTS audio but deployment uses real human speech. There's likely a domain gap. Possible mitigations: data augmentation (noise, room simulation), or fine-tuning on a small set of real recordings.
-
-## 8. Comparison with VLAS
+## 10. Comparison with VLAS
 
 | Aspect | VLAS | Ours |
 |--------|------|------|
@@ -282,13 +403,53 @@ Stage 3 uses synthesized TTS audio but deployment uses real human speech. There'
 | Projector | 2-layer MLP, 5x downsample | 2-layer MLP, 5x downsample (same) |
 | Stage 1 | ASR CE through frozen LLaMA | MSE embedding alignment (no Gemma in loop) |
 | Stage 2 | ASR CE, full unfreeze LLaMA | ASR CE, LoRA on Gemma (preserve image ability) |
-| Stage 3 | Robot task, full unfreeze | Robot task, LoRA on both experts, freeze projector |
+| Stage 3 | Robot task, full unfreeze | Robot task, dual LoRA, projector at low LR |
+| Audio/text mixing | Replace text with `<audio>` token | Remove text prompt (empty string) |
 | Key challenge | None major (LLaMA is unbiased) | PaliGemma has strong multimodal bias |
 | Action generation | Direct token prediction | Flow matching (continuous actions) |
+| Training data | BridgeData V2 | LIBERO (130 tasks) |
+| TTS voices | Not specified | 20 voices for LIBERO, 10 for DROID |
 
 The core architectural difference — PaliGemma's multimodal fine-tuning vs LLaMA's text-only pretraining — forced us to develop a fundamentally different Stage 1 approach and use LoRA instead of full fine-tuning throughout.
 
-## 9. Implementation Notes
+## 11. Complete Training Plan
+
+### Phase 1: TTS Synthesis (~14 hours)
+1. Synthesize DROID TTS: 31,420 instructions × 10 voices = 314,000 audio files
+2. Synthesize LIBERO TTS: 130 instructions × 20 voices = 2,600 audio files
+3. Generate manifests mapping prompt → list of audio file paths
+
+### Phase 2: Stage 2 — ASR Training (current: LibriSpeech only; future: mixed)
+**Current run** (in progress):
+- Config: `pi05_audio_stage2_asr_finetune`
+- Data: LibriSpeech train-clean-360 only
+- 10k steps, batch 32, LR 2e-5→2e-6
+
+**Future run** (after TTS synthesis):
+- Config: `pi05_audio_joint_asr` (modified for mixed dataset)
+- Data: 25% LibriSpeech train-clean-360 + 75% DROID TTS
+- 7,500 steps, batch 32
+
+**Go/no-go criteria before Stage 3**:
+- Loss below 4.0 (well below random chance ~12.5)
+- `scripts/diag_decode.py` shows varied greedy decode output across different audio samples
+- Audio token norms in Gemma's expected range (~40-60)
+
+### Phase 3: Stage 3 — LIBERO Robot Training
+- Config: `pi05_audio_stage3_libero`
+- Data: LIBERO (all 130 tasks), 60/40 audio/text mixing
+- Trainable: Gemma LoRA + action expert LoRA + action head + audio projector (10x lower LR)
+- 30k steps, batch 32, LR 2e-5→2e-6
+
+**Validation checkpoints**: Eval every 5k steps with `examples/libero/main.py --eval-mode both`
+
+### Phase 4: Evaluation
+- `examples/libero/main.py --eval-mode text` (text-only baseline)
+- `examples/libero/main.py --eval-mode audio` (audio-only)
+- `examples/libero/main.py --eval-mode both` (mixed)
+- Compare success rates across all 130 tasks
+
+## 12. Implementation Notes
 
 ### Flax Int-Key Bug
 
@@ -310,7 +471,18 @@ for kp, v in traverse_util.flatten_dict(partial_params).items():
 
 Added to `DownsampleAudioProjector` in `whisper.py` to bridge the norm gap between audio projector output (~100) and Gemma text embeddings (~240). Initialized to 2.4. This is a single scalar parameter that gets multiplied with the projector output. Since `_merge_params` in `weight_loaders.py` uses `missing_regex=".*audio_projector.*"`, this parameter correctly falls back to its init value (2.4) when loading Stage 1 checkpoints that predate its addition.
 
-## 10. Timeline and Iterations
+### Per-Parameter LR via Gradient Scaling
+
+Added `lr_scale_overrides` field to `TrainConfig` (dict mapping filter → float). In `train_step`, gradients for matched parameters are scaled before the optimizer:
+
+```python
+for filt, scale in config.lr_scale_overrides.items():
+    grads = nnx_utils.state_map(grads, filt, lambda p: p.replace(p.value * scale))
+```
+
+This is mathematically equivalent to per-parameter LR groups but requires only 3 lines of code. No changes to the optimizer, no label pytrees, no NNX State compatibility issues.
+
+## 13. Timeline and Iterations
 
 1. **Initial implementation**: Added Whisper encoder + audio projector to Pi0.5 model
 2. **Stage 1 v1 (ASR CE)**: Trained 5000 steps, loss converged but projector collapsed
@@ -320,4 +492,9 @@ Added to `DownsampleAudioProjector` in `whisper.py` to bridge the norm gap betwe
 6. **Stage 1 v2 training**: Loss drops fast, plateaus at ~0.21
 7. **Stage 1 v2 diagnostics**: Discovered projector collapse (single centroid direction). Attempted InfoNCE fix — failed because Gemma text embeddings are too similar (cosine > 0.995). Added learnable output scale (2.4x) to close norm gap.
 8. **Stage 2 + 3 config design**: Deep analysis of Pi0.5 attention sharing, chose LoRA + freeze strategy
-9. **Stage 2 training**: Started ASR fine-tune with LoRA. Loss dropping steadily (9.59 → 6.61 in 400 steps). Training in progress.
+9. **Stage 2 training**: Started ASR fine-tune with LoRA. Loss dropping steadily (9.59 → 6.61 in 400 steps).
+10. **Audio/text mutual exclusivity bug**: Discovered and fixed — AudioTextMixingTransform now removes text when audio is assigned, following VLAS design.
+11. **Training data strategy**: Analyzed DROID annotations (31.4k unique instructions), decided on 25% LibriSpeech + 75% DROID TTS mixing for improved domain coverage.
+12. **LIBERO visual ambiguity analysis**: 92% of tasks share scenes → instruction is essential → audio ignorability risk is low.
+13. **Stage 3 config finalized**: Projector unfrozen at 10x lower LR via gradient scaling. Per-parameter LR implemented as `lr_scale_overrides` on TrainConfig.
+14. **Complete training plan approved**: TTS synthesis → Stage 2 (mixed ASR) → Stage 3 (LIBERO) → evaluation.

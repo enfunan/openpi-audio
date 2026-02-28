@@ -168,6 +168,11 @@ def train_step(
     diff_state = nnx.DiffState(0, config.trainable_filter)
     loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
 
+    # Apply per-parameter LR scaling by scaling gradients before the optimizer.
+    # E.g., scaling audio_projector gradients by 0.1 gives it 10x lower effective LR.
+    for filt, scale in config.lr_scale_overrides.items():
+        grads = nnx_utils.state_map(grads, filt, lambda p: p.replace(p.value * scale))
+
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
     new_params = optax.apply_updates(params, updates)
