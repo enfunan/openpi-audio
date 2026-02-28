@@ -934,9 +934,11 @@ _CONFIGS = [
         data=LeRobotAlohaDataConfig(
             assets=AssetsConfig(asset_id="trossen"),
         ),
-        # Load from Stage 2 output checkpoint.
+        # Load from Stage 2 mixed ASR output checkpoint.
+        # Default assumes Stage 2 ran with config=pi05_audio_mixed_asr, exp_name=mixed_asr.
+        # Override at launch: --weight-loader.params-path=./checkpoints/.../params
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "./checkpoints/pi05_audio_stage2_asr_finetune/stage2_asr_finetune/latest/params"
+            "./checkpoints/pi05_audio_mixed_asr/mixed_asr/7500/params"
         ),
         # Freeze SigLIP + LLM base weights + Whisper + audio projector.
         # Trainable: Gemma LoRA + action expert LoRA + action head projections.
@@ -988,8 +990,11 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
+        # Load from Stage 2 mixed ASR output checkpoint.
+        # Default assumes Stage 2 ran with config=pi05_audio_mixed_asr, exp_name=mixed_asr.
+        # Override at launch: --weight-loader.params-path=./checkpoints/.../params
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "./checkpoints/pi05_audio_joint_asr/joint_asr/latest/params"
+            "./checkpoints/pi05_audio_mixed_asr/mixed_asr/7500/params"
         ),
         # Freeze SigLIP + LLM base weights + Whisper.
         # Trainable: Gemma LoRA + action expert LoRA + action head + audio projector.
