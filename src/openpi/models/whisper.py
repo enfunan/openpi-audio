@@ -62,6 +62,10 @@ class DownsampleAudioProjector(nn.Module):
 
     reduce_factor: int = 5
     embed_dim: int = 2048  # PaliGemma embedding width
+    # Scale factor to match text embedding norms. Stage 1 MSE alignment produces
+    # audio token norms ~100 but Gemma text embeddings have norms ~240. This learnable
+    # scale closes the gap so Stage 2 LoRA starts with properly-scaled audio tokens.
+    init_scale: float = 2.4
 
     @nn.compact
     def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
@@ -76,7 +80,10 @@ class DownsampleAudioProjector(nn.Module):
         x = nn.Dense(self.embed_dim, name="proj_in")(x)
         x = nn.gelu(x)
         x = nn.Dense(self.embed_dim, name="proj_out")(x)
-        return x
+
+        # Learnable output scale to match text embedding norms
+        scale = self.param("output_scale", lambda _: jnp.array(self.init_scale, dtype=jnp.float32))
+        return x * scale
 
 
 def load_whisper_params(variant: str = "openai/whisper-large-v2") -> dict:

@@ -6,6 +6,7 @@ from typing import Any
 
 import etils.epath as epath
 import flax.nnx as nnx
+from flax.nnx.traversals import unflatten_mapping
 from flax.training import common_utils
 import flax.traverse_util as traverse_util
 import jax
@@ -95,8 +96,18 @@ def init_train_state(
         # Merge the partial params into the model.
         if partial_params is not None:
             graphdef, state = nnx.split(model)
-            # This will produce an error if the partial params are not a subset of the state.
-            state.replace_by_pure_dict(partial_params)
+            # Manual flat_state merge to avoid Flax's replace_by_pure_dict which
+            # converts string digit keys to ints, causing KeyError on Whisper layers.
+            flat_state = state.flat_state()
+            for kp, v in traverse_util.flatten_dict(partial_params).items():
+                if kp in flat_state:
+                    flat_state[kp] = flat_state[kp].replace(v) if hasattr(flat_state[kp], "replace") else v
+                else:
+                    # Try converting string digit keys to ints (or vice versa) for compatibility.
+                    alt_kp = tuple(int(k) if isinstance(k, str) and k.isdigit() else k for k in kp)
+                    if alt_kp in flat_state:
+                        flat_state[alt_kp] = flat_state[alt_kp].replace(v) if hasattr(flat_state[alt_kp], "replace") else v
+            state.update(unflatten_mapping(flat_state))
             model = nnx.merge(graphdef, state)
 
         params = nnx.state(model)

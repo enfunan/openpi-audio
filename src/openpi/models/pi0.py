@@ -361,6 +361,10 @@ class Pi0(_model.BaseModel):
         Skips Gemma entirely — the audio projector learns to produce embeddings
         that match the frozen text embedding distribution (embed_table[tokens] * sqrt(d)).
         Mean-pools both modalities to handle sequence length mismatch (300 audio vs T text).
+
+        Note: InfoNCE contrastive loss was tried but is ineffective here because Gemma's
+        text embeddings are too similar (pairwise cosine > 0.995 across all samples).
+        Per-sample discrimination is instead achieved in Stage 2 via ASR CE through LoRA.
         """
         # Audio: mel → frozen Whisper → trainable projector → (B, 300, D)
         audio_hidden = jax.lax.stop_gradient(

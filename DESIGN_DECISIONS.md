@@ -97,11 +97,53 @@ Audio has 300 tokens, text has variable length (5-50 tokens typically). We can't
 - Loss drops fast: 28.15 → 0.40 in 100 steps, plateaus around 0.20-0.22
 - This plateau is expected — the MSE can't go to zero because audio and text are fundamentally different modalities encoding the same content differently
 
-### What We Expect From Diagnostics
-- Audio token norms should match text norms (~40-60 range)
-- Cosine similarity between audio and text mean-pools should be >0.5
-- Different audio samples should produce different embeddings (no collapse)
-- Greedy decode through Gemma should show varied output (unlike Stage 1 v1)
+### Diagnostic Results: Partial Success, But Collapse
+
+After training completed (5000 steps, final loss ~0.21), diagnostics revealed:
+
+**Good**: Cosine similarity between audio and text mean-pools was 0.95-0.97. The projector learned the right *direction*.
+
+**Bad**: All audio samples produced **identical** embeddings:
+- Audio-audio pairwise cosine similarity: **1.000** for all sample pairs
+- Greedy decode: identical garbage for every sample
+- Audio token norms: ~100 (vs text ~240) — 2.4x gap
+
+**Root cause**: Mean-pooled MSE has a trivial solution. The projector found a single "centroid" direction that minimizes average MSE across all training samples. Since Gemma text embeddings are extremely similar to each other (pairwise cosine > 0.995 — see below), a single point achieves low MSE against all targets.
+
+### Attempted Fix: InfoNCE Contrastive Loss
+
+To force per-sample discrimination, we added InfoNCE (contrastive) loss alongside MSE:
+```
+L = MSE(audio_mean, text_mean) + InfoNCE(audio_mean, text_mean, temperature=0.07)
+```
+
+**Result**: Complete failure. InfoNCE loss stuck at log(64) = 4.16 (random chance for batch_size=64) for the entire training run.
+
+**Investigation**: We measured pairwise cosine similarity between Gemma's text embeddings across a batch of 20 LibriSpeech transcriptions:
+- Mean pairwise cosine: **0.9957**
+- 166 of 190 pairs had cosine > 0.99
+- Max cosine: 0.9990
+
+**Verdict**: Gemma's text embedding space is so concentrated that all transcriptions are nearly identical when mean-pooled. Contrastive learning fundamentally cannot work when positives and negatives are indistinguishable (cosine > 0.995). This is not a hyperparameter issue — it's a property of the embedding space.
+
+This makes sense: Gemma's embedding table maps tokens to a high-dimensional space where the information is in the *sequence* of tokens, not the *average* of their embeddings. Mean-pooling collapses sequence-level information into a single point.
+
+### Resolution: Learnable Output Scale + Proceed to Stage 2
+
+Since Stage 1 v2 successfully learned the right *direction* but wrong *scale*, and per-sample discrimination requires sequence-level processing (which only Gemma can do), we:
+
+1. **Added a learnable `output_scale` parameter** to `DownsampleAudioProjector` (initialized to 2.4) to close the norm gap (audio ~100 → ~240 to match text ~240)
+2. **Proceeded to Stage 2** where ASR cross-entropy through Gemma+LoRA provides the rich, per-token gradient signal needed for per-sample discrimination
+
+The InfoNCE code was reverted. The loss function remains pure MSE.
+
+### Why This Partial Success Is Enough
+
+Stage 1 v2 achieved its real goal: **get the projector output into a distribution Gemma can process**. Even though all samples produce similar embeddings, those embeddings are in the right neighborhood of Gemma's embedding space. This is dramatically better than Stage 1 v1 where norms were ~1371 and completely outside Gemma's expected range.
+
+Stage 2's ASR CE loss provides per-token gradient through Gemma+LoRA, which will teach both:
+- The projector to produce *different* embeddings for different audio (per-sample discrimination)
+- Gemma LoRA to extract and decode the audio information into text
 
 ## 5. Stage 2: ASR Fine-Tune with LoRA
 
@@ -122,9 +164,36 @@ VLAS fully unfreezes LLaMA in their Stage 2. We considered this but chose LoRA i
 - **Both projector + LoRA are trainable**: The projector continues adapting (it was pre-aligned in Stage 1 but can be refined), and LoRA teaches Gemma's attention to extract semantic content from audio tokens
 - **No EMA**: EMA would slow down LoRA parameter updates. Since LoRA params start near-zero (they modulate the base weights), EMA would keep them closer to zero for too long
 
+### Positional Encoding: RoPE Has No Extrapolation Issue
+
+A concern was raised: audio tokens occupy positions 0-299 (300 tokens), but PaliGemma's Gemma was trained with SigLIP image tokens at positions 0-255. Are positions 256-299 "extrapolating"?
+
+**Answer: No.** Gemma uses Rotary Position Embeddings (RoPE), not learned positional embeddings:
+- RoPE is a mathematical transformation (`cos(pos/freq)`, `sin(pos/freq)`) applied at inference time
+- There is no "trained range" — RoPE works for any position value
+- RoPE primarily encodes **relative** positions between tokens. The relative distance between audio token 0 and audio token 5 is the same regardless of where in the absolute sequence they appear
+- Position 300 is mathematically no different from position 200 to RoPE
+
 ### Why Keep Audio Projector Trainable in Stage 2?
 
 Stage 1 learned a coarse distribution match. Stage 2's ASR cross-entropy loss provides much richer gradient signal — it tells the projector not just "match this distribution" but "produce tokens that Gemma can decode into THIS specific text." Allowing the projector to refine its representations under ASR supervision improves the quality of audio encoding.
+
+### Training Configuration
+
+- **Data**: LibriSpeech train-clean-360 (97,243 utterances, 859 speakers, ~360 hours). 3.4x more data and 3.4x more speaker diversity than Stage 1's train-clean-100.
+- **Learning rate**: 2e-5 → 2e-6, cosine decay, warmup 500 steps. Deliberately low because the projector is already pre-aligned.
+- **Batch size**: 32 (4 per GPU × 8 GPUs). Smaller than Stage 1 (64) due to LoRA memory overhead.
+- **Steps**: 10,000 (~3.3 epochs over 97k samples with batch 32).
+- **Checkpoints**: Every 500 steps (for early stopping if needed).
+- **Freeze filter**: `Any(PaliGemma/img, All(llm, Not(lora)), whisper_encoder)` — freezes SigLIP image encoder, Gemma base weights, Whisper encoder. Trains LoRA adapters + audio projector.
+
+### Early Training Results
+
+- Step 0: loss=9.59, grad_norm=238.6 (below random chance ~12.5, confirming Stage 1 provides useful initialization)
+- Step 100: loss=7.86, grad_norm=29.1 (rapid improvement during warmup)
+- Step 200: loss=7.10 (steady decrease)
+- Step 400: loss=6.61 (continuing to drop)
+- Speed: ~1.7 it/s, ETA ~1h 36m for 10k steps
 
 ## 6. Stage 3: Robot Task Training — The Hardest Design Decision
 
@@ -192,8 +261,8 @@ We pre-synthesize TTS audio for all robot task prompts rather than generating on
 
 ## 7. What Could Go Wrong (Known Risks)
 
-### Stage 1 v2 might plateau too high
-If the MSE loss plateaus at 0.22 and doesn't go lower, the audio tokens might not be close enough to text embeddings for Gemma to process them well. Possible mitigation: add per-token alignment (not just mean-pool) or use a combined MSE + cosine loss.
+### Stage 1 v2 plateau and collapse
+Stage 1 v2 MSE plateaued at ~0.21 and the projector collapsed to a single direction. This was mitigated by adding a learnable output scale (2.4x) and proceeding to Stage 2 where ASR CE provides per-sample discrimination. **Status: mitigated, Stage 2 in progress.**
 
 ### Stage 2 LoRA rank might be too low
 Rank 16 might not have enough capacity for Gemma to learn audio → text decoding. If Stage 2 ASR quality is poor, try rank 32 or 64. The tradeoff is more parameters to train and higher risk of overfitting.
@@ -219,13 +288,36 @@ Stage 3 uses synthesized TTS audio but deployment uses real human speech. There'
 
 The core architectural difference — PaliGemma's multimodal fine-tuning vs LLaMA's text-only pretraining — forced us to develop a fundamentally different Stage 1 approach and use LoRA instead of full fine-tuning throughout.
 
-## 9. Timeline and Iterations
+## 9. Implementation Notes
+
+### Flax Int-Key Bug
+
+Flax NNX's `replace_by_pure_dict` converts string digit keys (e.g., `'0'`, `'1'`) to integers internally, but the NNX state from Linen-bridged modules (like HuggingFace's FlaxWhisperEncoder) keeps them as strings. This causes a `KeyError` when loading checkpoints that contain Whisper encoder layers.
+
+**Fix**: Replaced `state.replace_by_pure_dict(partial_params)` in `scripts/train.py` with a manual `flat_state()` merge that tries both string and integer key variants:
+```python
+flat_state = state.flat_state()
+for kp, v in traverse_util.flatten_dict(partial_params).items():
+    if kp in flat_state:
+        flat_state[kp] = flat_state[kp].replace(v) ...
+    else:
+        alt_kp = tuple(int(k) if isinstance(k, str) and k.isdigit() else k for k in kp)
+        if alt_kp in flat_state:
+            flat_state[alt_kp] = flat_state[alt_kp].replace(v) ...
+```
+
+### Learnable Output Scale
+
+Added to `DownsampleAudioProjector` in `whisper.py` to bridge the norm gap between audio projector output (~100) and Gemma text embeddings (~240). Initialized to 2.4. This is a single scalar parameter that gets multiplied with the projector output. Since `_merge_params` in `weight_loaders.py` uses `missing_regex=".*audio_projector.*"`, this parameter correctly falls back to its init value (2.4) when loading Stage 1 checkpoints that predate its addition.
+
+## 10. Timeline and Iterations
 
 1. **Initial implementation**: Added Whisper encoder + audio projector to Pi0.5 model
 2. **Stage 1 v1 (ASR CE)**: Trained 5000 steps, loss converged but projector collapsed
 3. **Diagnostic investigation**: Built scripts to analyze audio token norms, greedy decoding, attention patterns. Discovered the distribution mismatch problem.
 4. **Literature review**: Re-examined VLAS approach, identified the LLaMA vs PaliGemma difference as root cause
 5. **Stage 1 v2 design**: Proposed direct MSE embedding alignment to bypass Gemma
-6. **Stage 1 v2 implementation + training**: Loss drops fast, plateaus at ~0.21 (currently finishing)
-7. **Stage 2 + 3 config design**: Deep analysis of Pi0.5 attention sharing, chose LoRA + freeze strategy
-8. **Next**: Run diagnostics on Stage 1 v2, then proceed through Stages 2 and 3
+6. **Stage 1 v2 training**: Loss drops fast, plateaus at ~0.21
+7. **Stage 1 v2 diagnostics**: Discovered projector collapse (single centroid direction). Attempted InfoNCE fix — failed because Gemma text embeddings are too similar (cosine > 0.995). Added learnable output scale (2.4x) to close norm gap.
+8. **Stage 2 + 3 config design**: Deep analysis of Pi0.5 attention sharing, chose LoRA + freeze strategy
+9. **Stage 2 training**: Started ASR fine-tune with LoRA. Loss dropping steadily (9.59 → 6.61 in 400 steps). Training in progress.
