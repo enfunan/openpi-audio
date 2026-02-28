@@ -938,7 +938,7 @@ _CONFIGS = [
         # Default assumes Stage 2 ran with config=pi05_audio_mixed_asr, exp_name=mixed_asr.
         # Override at launch: --weight-loader.params-path=./checkpoints/.../params
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "./checkpoints/pi05_audio_mixed_asr/mixed_asr/7500/params"
+            "./checkpoints/pi05_audio_mixed_asr/mixed_asr/7499/params"
         ),
         # Freeze SigLIP + LLM base weights + Whisper + audio projector.
         # Trainable: Gemma LoRA + action expert LoRA + action head projections.
@@ -994,7 +994,7 @@ _CONFIGS = [
         # Default assumes Stage 2 ran with config=pi05_audio_mixed_asr, exp_name=mixed_asr.
         # Override at launch: --weight-loader.params-path=./checkpoints/.../params
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "./checkpoints/pi05_audio_mixed_asr/mixed_asr/7500/params"
+            "./checkpoints/pi05_audio_mixed_asr/mixed_asr/7499/params"
         ),
         # Freeze SigLIP + LLM base weights + Whisper.
         # Trainable: Gemma LoRA + action expert LoRA + action head + audio projector.
