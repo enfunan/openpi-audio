@@ -26,6 +26,7 @@ import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
 
@@ -113,29 +114,37 @@ class ModelTransformFactory(GroupFactory):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
             case _model.ModelType.PI0:
-                return _transforms.Group(
-                    inputs=[
-                        _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
-                        _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
-                        ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
-                    ],
-                )
+                input_transforms = [
+                    _transforms.InjectDefaultPrompt(self.default_prompt),
+                    _transforms.ResizeImages(224, 224),
+                    _transforms.TokenizePrompt(
+                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                    ),
+                    _transforms.PadStatesAndActions(model_config.action_dim),
+                ]
+                if isinstance(model_config, pi0_config.Pi0Config) and model_config.audio_enabled:
+                    input_transforms.insert(
+                        -1,  # Insert before PadStatesAndActions
+                        _transforms.AudioPreprocess(whisper_variant=model_config.whisper_variant),
+                    )
+                return _transforms.Group(inputs=input_transforms)
             case _model.ModelType.PI05:
                 assert isinstance(model_config, pi0_config.Pi0Config)
-                return _transforms.Group(
-                    inputs=[
-                        _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
-                        _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
-                            discrete_state_input=model_config.discrete_state_input,
-                        ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
-                    ],
-                )
+                input_transforms = [
+                    _transforms.InjectDefaultPrompt(self.default_prompt),
+                    _transforms.ResizeImages(224, 224),
+                    _transforms.TokenizePrompt(
+                        _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                        discrete_state_input=model_config.discrete_state_input,
+                    ),
+                    _transforms.PadStatesAndActions(model_config.action_dim),
+                ]
+                if model_config.audio_enabled:
+                    input_transforms.insert(
+                        -1,  # Insert before PadStatesAndActions
+                        _transforms.AudioPreprocess(whisper_variant=model_config.whisper_variant),
+                    )
+                return _transforms.Group(inputs=input_transforms)
             case _model.ModelType.PI0_FAST:
                 tokenizer_cls = (
                     _tokenizer.FASTTokenizer
@@ -237,6 +246,11 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     # use standard Aloha data should set this to true.
     adapt_to_pi: bool = True
 
+    # TTS cache directory for audio/text mixing (Stage 3). If empty, no audio mixing is applied.
+    tts_cache_dir: str = ""
+    # Ratio of samples that receive TTS audio (vs. text-only) when tts_cache_dir is set.
+    audio_ratio: float = 0.6
+
     # Repack transforms.
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
         default=_transforms.Group(
@@ -269,6 +283,17 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
+        # Inject AudioTextMixingTransform before model transforms when TTS cache is available.
+        if self.tts_cache_dir:
+            mixing_transform = _transforms.AudioTextMixingTransform(
+                audio_ratio=self.audio_ratio,
+                tts_cache_dir=self.tts_cache_dir,
+            )
+            model_transforms = _transforms.Group(
+                inputs=[mixing_transform, *model_transforms.inputs],
+                outputs=model_transforms.outputs,
+            )
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=self.repack_transforms,
@@ -287,6 +312,11 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     """
 
     extra_delta_transform: bool = False
+
+    # TTS cache directory for audio/text mixing (Stage 3). If empty, no audio mixing is applied.
+    tts_cache_dir: str = ""
+    # Ratio of samples that receive TTS audio (vs. text-only) when tts_cache_dir is set.
+    audio_ratio: float = 0.6
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -345,6 +375,17 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # Model transforms include things like tokenizing the prompt and action targets
         # You do not need to change anything here for your own dataset.
         model_transforms = ModelTransformFactory()(model_config)
+
+        # Inject AudioTextMixingTransform before model transforms when TTS cache is available.
+        if self.tts_cache_dir:
+            mixing_transform = _transforms.AudioTextMixingTransform(
+                audio_ratio=self.audio_ratio,
+                tts_cache_dir=self.tts_cache_dir,
+            )
+            model_transforms = _transforms.Group(
+                inputs=[mixing_transform, *model_transforms.inputs],
+                outputs=model_transforms.outputs,
+            )
 
         # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
@@ -463,6 +504,35 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LibriSpeechDataConfig(DataConfigFactory):
+    """Data config for LibriSpeech ASR alignment training (Stage 1).
+
+    Uses the LibriSpeech dataset to train the audio projector via embedding regression.
+    The dataset provides audio_path and transcription text; dummy images/actions/states
+    are created for pipeline compatibility.
+    """
+
+    # Path to the LibriSpeech data split directory (e.g., /data/librispeech/train-clean-100).
+    data_dir: str = ""
+    repo_id: str = "librispeech"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        assert isinstance(model_config, pi0_config.Pi0Config)
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return DataConfig(
+            # "librispeech" signals the data loader to use LibriSpeechDataset.
+            repo_id="librispeech",
+            asset_id=None,
+            norm_stats=None,
+            model_transforms=model_transforms,
+            # Reuse rlds_data_dir to pass the LibriSpeech data path to the data loader.
+            rlds_data_dir=self.data_dir,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -576,6 +646,233 @@ _CONFIGS = [
             assets=AssetsConfig(asset_id="trossen"),
         ),
         policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
+    ),
+    TrainConfig(
+        name="pi05_audio_aloha",
+        model=pi0_config.Pi0Config(pi05=True, audio_enabled=True),
+        data=LeRobotAlohaDataConfig(
+            assets=AssetsConfig(asset_id="trossen"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, audio_enabled=True).get_freeze_filter(),
+        num_train_steps=30_000,
+        policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
+    ),
+    #
+    # Multi-stage audio training pipeline configs.
+    #
+    # Stage 1: ASR alignment — trains only the audio projector via ASR cross-entropy
+    # on LibriSpeech. Audio tokens are fed as prefix through frozen Gemma LLM to
+    # predict transcription text (following VLAS, CVPR).
+    TrainConfig(
+        name="pi05_audio_stage1_asr",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            audio_enabled=True,
+            training_stage="asr_alignment",
+            discrete_state_input=False,
+        ),
+        data=LibriSpeechDataConfig(
+            data_dir="",  # Override via --data.data_dir /path/to/librispeech/train-clean-100
+        ),
+        # Load base Pi0.5 checkpoint + pretrained Whisper weights.
+        weight_loader=weight_loaders.CompositeWeightLoader(
+            loaders=(
+                weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+                weight_loaders.WhisperWeightLoader(),
+            ),
+        ),
+        # Freeze everything except the audio projector.
+        freeze_filter=nnx.Not(
+            nnx_utils.PathRegex(".*audio_projector.*"),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=1e-3,
+            decay_steps=5000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=5000,
+        batch_size=64,
+        save_interval=1000,
+        log_interval=50,
+        wandb_enabled=True,
+        exp_name="stage1_asr",
+    ),
+    # Stage 1 (v2): Direct embedding alignment — trains audio projector via MSE loss
+    # to match frozen text embeddings. Skips Gemma entirely so the projector gets
+    # direct gradient signal and learns the correct embedding distribution.
+    TrainConfig(
+        name="pi05_audio_stage1_embed_align",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            audio_enabled=True,
+            training_stage="embedding_alignment",
+            discrete_state_input=False,
+        ),
+        data=LibriSpeechDataConfig(
+            data_dir="",  # Override via --data.data_dir /path/to/librispeech/train-clean-100
+        ),
+        weight_loader=weight_loaders.CompositeWeightLoader(
+            loaders=(
+                weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+                weight_loaders.WhisperWeightLoader(),
+            ),
+        ),
+        # Freeze everything except the audio projector.
+        freeze_filter=nnx.Not(
+            nnx_utils.PathRegex(".*audio_projector.*"),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=1e-3,
+            decay_steps=5000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=5000,
+        batch_size=64,
+        save_interval=1000,
+        log_interval=50,
+        wandb_enabled=True,
+        exp_name="stage1_embed_align",
+    ),
+    # Stage 2: ASR fine-tuning with LoRA on Gemma. Loads Stage 1 v2 (embedding-aligned)
+    # checkpoint so the audio projector already outputs text-distribution embeddings.
+    # LoRA adapters on Gemma learn to decode audio prefix tokens into text while
+    # preserving base Gemma weights (safe against catastrophic forgetting).
+    # Uses LibriSpeech train-clean-360 (97k samples, 859 speakers) for more diversity.
+    TrainConfig(
+        name="pi05_audio_stage2_asr_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            audio_enabled=True,
+            training_stage="asr_alignment",
+            paligemma_variant="gemma_2b_lora",
+            discrete_state_input=False,
+        ),
+        data=LibriSpeechDataConfig(
+            data_dir="",  # Override via --data.data_dir /path/to/librispeech/train-clean-360
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "./checkpoints/pi05_audio_stage1_embed_align/stage1_embed_align_5k/4999/params"
+        ),
+        # Freeze Gemma + action expert base weights, SigLIP, Whisper.
+        # Trainable: Gemma LoRA adapters + audio projector.
+        freeze_filter=nnx.Any(
+            nnx_utils.PathRegex(".*PaliGemma/img.*"),
+            nnx.All(
+                nnx_utils.PathRegex(".*llm.*"),
+                nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+            ),
+            nnx_utils.PathRegex(".*whisper_encoder.*"),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=2e-5,
+            decay_steps=10_000,
+            decay_lr=2e-6,
+        ),
+        ema_decay=None,
+        num_train_steps=10_000,
+        batch_size=32,
+        save_interval=2000,
+        log_interval=50,
+        wandb_enabled=True,
+        exp_name="stage2_asr_finetune",
+    ),
+    # Stage 3: Robot task training with LoRA + audio/text mixing (60/40).
+    # Loads Stage 2 checkpoint (Gemma LoRA adapted to audio).
+    # Trainable: Gemma LoRA + action expert LoRA + action head projections.
+    # Frozen: audio projector (preserves learned embedding distribution).
+    TrainConfig(
+        name="pi05_audio_stage3_aloha",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            audio_enabled=True,
+            training_stage="robot_task",
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotAlohaDataConfig(
+            assets=AssetsConfig(asset_id="trossen"),
+        ),
+        # Load from Stage 2 output checkpoint.
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "./checkpoints/pi05_audio_stage2_asr_finetune/stage2_asr_finetune/latest/params"
+        ),
+        # Freeze SigLIP + LLM base weights + Whisper + audio projector.
+        # Trainable: Gemma LoRA + action expert LoRA + action head projections.
+        freeze_filter=nnx.Any(
+            nnx_utils.PathRegex(".*PaliGemma/img.*"),
+            nnx.All(
+                nnx_utils.PathRegex(".*llm.*"),
+                nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+            ),
+            nnx_utils.PathRegex(".*whisper_encoder.*"),
+            nnx_utils.PathRegex(".*audio_projector.*"),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2e-5,
+            decay_steps=30_000,
+            decay_lr=2e-6,
+        ),
+        ema_decay=None,
+        num_train_steps=30_000,
+        batch_size=32,
+        save_interval=1_000,
+        wandb_enabled=True,
+        exp_name="stage3_aloha",
+        policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
+    ),
+    # Stage 3: LIBERO robot task training with LoRA + audio/text mixing (60/40).
+    # Loads Stage 2 checkpoint (Gemma LoRA adapted to audio).
+    # Trainable: Gemma LoRA + action expert LoRA + action head projections.
+    # Frozen: audio projector (preserves learned embedding distribution).
+    # Set --data.tts_cache_dir and --data.audio_ratio at runtime.
+    TrainConfig(
+        name="pi05_audio_stage3_libero",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            audio_enabled=True,
+            training_stage="robot_task",
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "./checkpoints/pi05_audio_stage2_asr_finetune/stage2_asr_finetune/latest/params"
+        ),
+        # Freeze SigLIP + LLM base weights + Whisper + audio projector.
+        # Trainable: Gemma LoRA + action expert LoRA + action head projections.
+        freeze_filter=nnx.Any(
+            nnx_utils.PathRegex(".*PaliGemma/img.*"),
+            nnx.All(
+                nnx_utils.PathRegex(".*llm.*"),
+                nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+            ),
+            nnx_utils.PathRegex(".*whisper_encoder.*"),
+            nnx_utils.PathRegex(".*audio_projector.*"),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2e-5,
+            decay_steps=30_000,
+            decay_lr=2e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=30_000,
+        batch_size=32,
+        save_interval=1_000,
+        wandb_enabled=True,
+        exp_name="stage3_libero",
     ),
     TrainConfig(
         name="pi0_aloha_towel",

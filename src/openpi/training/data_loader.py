@@ -136,6 +136,19 @@ def create_torch_dataset(
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
+    if repo_id == "librispeech":
+        from openpi.training.librispeech_dataset import LibriSpeechDataset
+
+        librispeech_dir = data_config.rlds_data_dir
+        if not librispeech_dir:
+            raise ValueError(
+                "LibriSpeech data_dir not set. Pass --data.data_dir to specify the LibriSpeech split directory."
+            )
+        return LibriSpeechDataset(
+            data_dir=librispeech_dir,
+            action_dim=model_config.action_dim,
+            action_horizon=model_config.action_horizon,
+        )
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
@@ -172,7 +185,7 @@ def create_rlds_dataset(
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
-    if data_config.repo_id != "fake" and not skip_norm_stats:
+    if data_config.repo_id not in ("fake", "librispeech") and not skip_norm_stats:
         if data_config.norm_stats is None:
             raise ValueError(
                 "Normalization stats not found. "
@@ -200,7 +213,7 @@ def transform_iterable_dataset(
 ) -> IterableDataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
-    if data_config.repo_id != "fake" and not skip_norm_stats:
+    if data_config.repo_id not in ("fake", "librispeech") and not skip_norm_stats:
         if data_config.norm_stats is None:
             raise ValueError(
                 "Normalization stats not found. "
@@ -242,7 +255,7 @@ def create_data_loader(
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
-    if data_config.rlds_data_dir is not None:
+    if data_config.rlds_data_dir is not None and data_config.repo_id != "librispeech":
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,

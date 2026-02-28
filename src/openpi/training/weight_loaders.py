@@ -50,8 +50,8 @@ class CheckpointWeightLoader(WeightLoader):
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        # Add all missing LoRA and audio weights (audio params won't exist in base checkpoints).
+        return _merge_params(loaded_params, params, missing_regex=".*lora.*|.*whisper_encoder.*|.*audio_projector.*|.*alignment_pooler.*")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -71,6 +71,47 @@ class PaliGemmaWeightLoader(WeightLoader):
         loaded_params = {"PaliGemma": flax.traverse_util.unflatten_dict(flat_params, sep="/")["params"]}
         # Add all missing weights.
         return _merge_params(loaded_params, params, missing_regex=".*")
+
+
+@dataclasses.dataclass(frozen=True)
+class WhisperWeightLoader(WeightLoader):
+    """Loads pretrained Whisper encoder weights from HuggingFace.
+
+    Merges the encoder weights into the model params tree at the whisper_encoder key path.
+    All other parameters (audio projector, LLM, etc.) are kept from the reference params.
+    """
+
+    variant: str = "openai/whisper-large-v2"
+
+    def load(self, params: at.Params) -> at.Params:
+        from openpi.models.whisper import load_whisper_params
+
+        # load_whisper_params returns {"encoder": {<raw HF encoder params>}}
+        # which matches our WhisperEncoder Linen module's param tree.
+        whisper_params = load_whisper_params(self.variant)
+
+        # Place under the whisper_encoder key path to match model structure.
+        # The ToNNX bridge wraps linen modules under a "module" subkey.
+        loaded_params = {"whisper_encoder": {"module": whisper_params}}
+
+        # Merge: loaded whisper params + all missing params from reference (projector, LLM, etc.)
+        return _merge_params(loaded_params, params, missing_regex=".*")
+
+
+@dataclasses.dataclass(frozen=True)
+class CompositeWeightLoader(WeightLoader):
+    """Chains multiple weight loaders, applying them sequentially.
+
+    Each loader's output is fed as the input params to the next loader.
+    This allows combining, e.g., a base checkpoint loader with a Whisper weight loader.
+    """
+
+    loaders: tuple[WeightLoader, ...]
+
+    def load(self, params: at.Params) -> at.Params:
+        for loader in self.loaders:
+            params = loader.load(params)
+        return params
 
 
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:

@@ -385,6 +385,10 @@ class Module(nn.Module):
     def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
         return self.embedder.encode(tokens).astype(self.embed_dtype)
 
+    def decode(self, hidden):
+        """Convert hidden states to vocab logits via tied embedding weights."""
+        return self.embedder.decode(hidden)
+
     @at.typecheck
     def __call__(
         self,

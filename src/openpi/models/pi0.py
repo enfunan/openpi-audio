@@ -5,12 +5,14 @@ import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
+import optax
 from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
+import openpi.models.whisper as _whisper
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
@@ -63,10 +65,56 @@ def posemb_sincos(
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
 
+class AlignmentPooler(nnx.Module):
+    """Cross-attention pooler with fixed latent queries for Stage 1 alignment.
+
+    Uses K learnable query vectors that cross-attend to input tokens (audio or text),
+    producing K output vectors. Shared queries ensure audio and text are projected
+    into the same concept space, enabling token-level alignment.
+
+    This is similar to Q-Former (BLIP-2) / Perceiver but much simpler:
+    just scaled dot-product cross-attention with a single head.
+    """
+
+    def __init__(self, num_queries: int, embed_dim: int, rngs: nnx.Rngs):
+        self.num_queries = num_queries
+        self.embed_dim = embed_dim
+        self.queries = nnx.Param(
+            jax.random.normal(rngs.params(), (num_queries, embed_dim)) * 0.02
+        )
+        self.out_proj = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
+
+    def __call__(self, tokens: at.Array, mask: at.Array | None = None) -> at.Array:
+        """Cross-attend learnable queries to input tokens.
+
+        Args:
+            tokens: (B, S, D) input token embeddings (audio or text).
+            mask: (B, S) optional boolean mask. True = valid token.
+
+        Returns:
+            (B, K, D) pooled representations, one per query.
+        """
+        b = tokens.shape[0]
+        queries = jnp.broadcast_to(self.queries.value[None], (b, self.num_queries, self.embed_dim))
+
+        # Scaled dot-product cross-attention: Q=queries, K=V=tokens.
+        scale = self.embed_dim ** -0.5
+        attn_logits = jnp.matmul(queries, tokens.transpose(0, 2, 1)) * scale  # (B, K, S)
+
+        if mask is not None:
+            # Mask out invalid tokens with large negative value.
+            attn_logits = jnp.where(mask[:, None, :], attn_logits, -1e9)
+
+        attn_weights = jax.nn.softmax(attn_logits, axis=-1)  # (B, K, S)
+        pooled = jnp.matmul(attn_weights, tokens)  # (B, K, D)
+        return self.out_proj(pooled)
+
+
 class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.audio_enabled = config.audio_enabled
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -99,6 +147,39 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
+        # Audio (speech) input modules.
+        if config.audio_enabled:
+            self.audio_reduce_factor = config.audio_reduce_factor
+            self.audio_num_tokens = _whisper.WHISPER_SEQ_LEN // config.audio_reduce_factor
+
+            whisper_enc = nnx_bridge.ToNNX(
+                _whisper.WhisperEncoder(variant=config.whisper_variant)
+            )
+            # Initialize with a dummy mel spectrogram.
+            dummy_mel = jnp.zeros((1, 80, 3000), dtype=jnp.float32)
+            whisper_enc.lazy_init(dummy_mel, deterministic=True, rngs=rngs)
+            self.whisper_encoder = whisper_enc
+
+            audio_proj = nnx_bridge.ToNNX(
+                _whisper.DownsampleAudioProjector(
+                    reduce_factor=config.audio_reduce_factor,
+                    embed_dim=paligemma_config.width,
+                )
+            )
+            # Initialize with dummy encoder output.
+            dummy_hidden = jnp.zeros((1, _whisper.WHISPER_SEQ_LEN, _whisper.WHISPER_HIDDEN_DIM), dtype=jnp.float32)
+            audio_proj.lazy_init(dummy_hidden, rngs=rngs)
+            self.audio_projector = audio_proj
+
+            # Alignment pooler for Stage 1 ASR training. Uses 64 learnable queries
+            # that cross-attend to both audio and text tokens for token-level alignment.
+            self.alignment_pooler = AlignmentPooler(
+                num_queries=64, embed_dim=paligemma_config.width, rngs=rngs
+            )
+
+        # Training stage for multi-stage audio pipeline (set by Pi0Config.create()).
+        self._training_stage: str | None = None
+
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
@@ -123,6 +204,24 @@ class Pi0(_model.BaseModel):
             )
             # image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
+
+        # embed audio (speech input via Whisper encoder)
+        if self.audio_enabled and obs.audio is not None:
+            # Whisper encoder is frozen — stop gradients.
+            audio_hidden = jax.lax.stop_gradient(
+                self.whisper_encoder(obs.audio, deterministic=True)
+            )
+            audio_tokens = self.audio_projector(audio_hidden)
+            tokens.append(audio_tokens)
+            input_mask.append(
+                einops.repeat(
+                    obs.audio_mask,
+                    "b -> b s",
+                    s=self.audio_num_tokens,
+                )
+            )
+            # audio tokens use bidirectional attention (same as image/language)
+            ar_mask += [False] * self.audio_num_tokens
 
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
@@ -185,10 +284,117 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 
+    def compute_alignment_loss(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, *, train: bool = False
+    ) -> at.Float[at.Array, ""]:
+        """ASR cross-entropy loss for Stage 1 audio alignment.
+
+        Feeds audio tokens as a bidirectional prefix through frozen Gemma LLM,
+        then predicts transcription text token-by-token with causal attention.
+        Only the audio projector receives gradients (everything else is frozen,
+        but JAX autodiff propagates gradients through frozen layers via chain rule).
+
+        Sequence layout: [audio_tokens (300) | text_tokens (T)]
+          - Audio: bidirectional attention (prefix)
+          - Text: causal attention (conditioned on all audio + prior text)
+
+        This follows VLAS (CVPR): each transcription token provides a gradient
+        signal (~50-200 per sample vs 1 for InfoNCE).
+        """
+        # Audio path: mel → frozen Whisper → trainable audio_projector → (B, 300, D)
+        audio_hidden = jax.lax.stop_gradient(
+            self.whisper_encoder(observation.audio, deterministic=True)
+        )
+        audio_tokens = self.audio_projector(audio_hidden)  # (B, 300, D)
+        num_audio = audio_tokens.shape[1]  # 300
+
+        # Text path: tokenized_prompt → frozen PaliGemma embedder → (B, T, D)
+        text_emb = jax.lax.stop_gradient(
+            self.PaliGemma.llm(observation.tokenized_prompt, method="embed")
+        )  # (B, T, D)
+        num_text = text_emb.shape[1]
+
+        # Concatenate: [audio_tokens | text_tokens] → (B, 300+T, D)
+        tokens = jnp.concatenate([audio_tokens, text_emb], axis=1)
+
+        # Build attention mask: prefix-LM pattern.
+        # Audio tokens: bidirectional (ar_mask=False) — attend to each other.
+        # Text tokens: causal (ar_mask=True) — attend to all audio + prior text.
+        input_mask = jnp.concatenate([
+            jnp.ones((tokens.shape[0], num_audio), dtype=jnp.bool_),
+            observation.tokenized_prompt_mask,
+        ], axis=1)  # (B, 300+T)
+        ar_mask = jnp.concatenate([
+            jnp.zeros(num_audio, dtype=jnp.bool_),
+            jnp.ones(num_text, dtype=jnp.bool_),
+        ])  # (300+T,)
+        attn_mask = make_attn_mask(input_mask, ar_mask)  # (B, 300+T, 300+T)
+
+        # Positions (0-indexed, per valid token).
+        positions = jnp.cumsum(input_mask, axis=1) - 1  # (B, 300+T)
+
+        # Forward through frozen Gemma (PaliGemma expert only, action expert=None).
+        # Gradients flow back through frozen weights to audio_projector via chain rule.
+        (hidden_states, _), _ = self.PaliGemma.llm(
+            [tokens, None], positions=positions, mask=attn_mask, adarms_cond=[None, None]
+        )  # hidden_states: (B, 300+T, D)
+
+        # Extract hidden states for next-token prediction of text tokens.
+        # hidden[num_audio-1] predicts text[0], hidden[num_audio] predicts text[1], etc.
+        text_hidden = hidden_states[:, num_audio - 1 : num_audio - 1 + num_text]  # (B, T, D)
+
+        # Decode to vocab logits via tied embedding weights.
+        # Cast to float32 for numerical stability in softmax + cross-entropy.
+        logits = self.PaliGemma.llm(text_hidden, method="decode").astype(jnp.float32)  # (B, T, vocab_size)
+
+        # Cross-entropy loss against text token ids, masked by valid text tokens.
+        text_targets = observation.tokenized_prompt  # (B, T)
+        text_mask = observation.tokenized_prompt_mask  # (B, T)
+        token_losses = optax.softmax_cross_entropy_with_integer_labels(logits, text_targets)  # (B, T)
+        return jnp.sum(token_losses * text_mask) / (jnp.sum(text_mask) + 1e-6)
+
+    def compute_embedding_alignment_loss(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, *, train: bool = False
+    ) -> at.Float[at.Array, ""]:
+        """MSE loss aligning audio projector output to text embeddings directly.
+
+        Skips Gemma entirely — the audio projector learns to produce embeddings
+        that match the frozen text embedding distribution (embed_table[tokens] * sqrt(d)).
+        Mean-pools both modalities to handle sequence length mismatch (300 audio vs T text).
+        """
+        # Audio: mel → frozen Whisper → trainable projector → (B, 300, D)
+        audio_hidden = jax.lax.stop_gradient(
+            self.whisper_encoder(observation.audio, deterministic=True)
+        )
+        audio_tokens = self.audio_projector(audio_hidden)  # (B, 300, D)
+
+        # Text: tokenize → frozen embedder → (B, T, D), scaled by √d
+        text_emb = jax.lax.stop_gradient(
+            self.PaliGemma.llm(observation.tokenized_prompt, method="embed")
+        )  # (B, T, D)
+
+        # Mean-pool both (masked for valid text tokens)
+        text_mask = observation.tokenized_prompt_mask  # (B, T)
+        text_mean = jnp.sum(text_emb * text_mask[..., None], axis=1) / (jnp.sum(text_mask, axis=1, keepdims=True) + 1e-6)
+        audio_mean = jnp.mean(audio_tokens, axis=1)  # (B, D)
+
+        # MSE loss
+        return jnp.mean(jnp.square(audio_mean - text_mean))
+
     @override
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        # Dispatch to alignment loss for ASR alignment stage.
+        if self._training_stage == "asr_alignment":
+            loss = self.compute_alignment_loss(rng, observation, train=train)
+            batch_shape = actions.shape[:-2]
+            return jnp.broadcast_to(loss, (*batch_shape, self.action_horizon))
+        if self._training_stage == "embedding_alignment":
+            loss = self.compute_embedding_alignment_loss(rng, observation, train=train)
+            batch_shape = actions.shape[:-2]
+            return jnp.broadcast_to(loss, (*batch_shape, self.action_horizon))
+
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 

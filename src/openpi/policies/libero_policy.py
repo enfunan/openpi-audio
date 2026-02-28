@@ -80,6 +80,12 @@ class LiberoInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        # Pass through audio keys for audio-enabled models.
+        if "audio_path" in data:
+            inputs["audio_path"] = data["audio_path"]
+        if "audio" in data:
+            inputs["audio"] = data["audio"]
+
         return inputs
 
 

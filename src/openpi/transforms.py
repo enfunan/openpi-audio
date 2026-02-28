@@ -325,6 +325,127 @@ class PromptFromLeRobotTask(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class AudioPreprocess(DataTransformFn):
+    """Preprocesses audio input for the Whisper encoder.
+
+    If "audio_path" exists in data: loads the audio file at 16kHz and converts
+    to a mel spectrogram via WhisperFeatureExtractor.
+    If absent: produces a zero tensor (80, 3000) with audio_mask=False.
+    """
+
+    whisper_variant: str = "openai/whisper-large-v2"
+
+    def __post_init__(self):
+        # Cache the feature extractor instance (lazy-loaded on first call).
+        object.__setattr__(self, "_feature_extractor", None)
+
+    def _get_feature_extractor(self):
+        if self._feature_extractor is None:
+            from transformers import WhisperFeatureExtractor
+
+            fe = WhisperFeatureExtractor.from_pretrained(self.whisper_variant)
+            object.__setattr__(self, "_feature_extractor", fe)
+        return self._feature_extractor
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "audio_path" in data:
+            import librosa
+
+            audio_path = data.pop("audio_path")
+            if isinstance(audio_path, np.ndarray):
+                audio_path = audio_path.item()
+
+            # Load audio at 16kHz (Whisper's expected sample rate).
+            waveform, _ = librosa.load(audio_path, sr=16000)
+
+            fe = self._get_feature_extractor()
+            features = fe(waveform, sampling_rate=16000, return_tensors="np")
+            mel = features.input_features[0]  # (80, 3000)
+
+            data["audio"] = mel.astype(np.float32)
+            data["audio_mask"] = np.bool_(True)
+        elif "audio" in data:
+            # Raw audio waveform provided directly.
+            import librosa
+
+            waveform = data.pop("audio")
+            if isinstance(waveform, np.ndarray) and waveform.ndim == 1:
+                fe = self._get_feature_extractor()
+                features = fe(waveform, sampling_rate=16000, return_tensors="np")
+                mel = features.input_features[0]
+
+                data["audio"] = mel.astype(np.float32)
+                data["audio_mask"] = np.bool_(True)
+            else:
+                # Assume it's already a mel spectrogram.
+                data["audio_mask"] = np.bool_(True)
+        else:
+            # No audio provided — produce zero padding.
+            data["audio"] = np.zeros((80, 3000), dtype=np.float32)
+            data["audio_mask"] = np.bool_(False)
+
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class AudioTextMixingTransform(DataTransformFn):
+    """Mixes audio and text-only examples for Stage 3 training.
+
+    With probability `audio_ratio`, looks up a pre-synthesized TTS audio file
+    for the current prompt from a manifest and injects it as `audio_path`.
+    Otherwise, the sample is left as text-only (no audio_path), so that
+    AudioPreprocess will produce a zero tensor with audio_mask=False.
+    """
+
+    audio_ratio: float = 0.6
+    tts_cache_dir: str = ""
+
+    def __post_init__(self):
+        object.__setattr__(self, "_manifest", None)
+        object.__setattr__(self, "_rng", None)
+
+    def _get_manifest(self) -> dict:
+        if self._manifest is None:
+            import json
+            import pathlib
+
+            manifest_path = pathlib.Path(self.tts_cache_dir) / "manifest.json"
+            if not manifest_path.exists():
+                raise FileNotFoundError(
+                    f"TTS manifest not found at {manifest_path}. "
+                    "Run scripts/synthesize_tts.py first to generate the TTS cache."
+                )
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            object.__setattr__(self, "_manifest", manifest)
+        return self._manifest
+
+    def _get_rng(self):
+        if self._rng is None:
+            import random
+
+            object.__setattr__(self, "_rng", random.Random())
+        return self._rng
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if not self.tts_cache_dir:
+            return data
+
+        rng = self._get_rng()
+        if rng.random() < self.audio_ratio:
+            prompt = data.get("prompt")
+            if prompt is not None:
+                if isinstance(prompt, np.ndarray):
+                    prompt = prompt.item()
+                manifest = self._get_manifest()
+                # Look up TTS audio files for this prompt.
+                audio_files = manifest.get(prompt)
+                if audio_files:
+                    data["audio_path"] = rng.choice(audio_files)
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class PadStatesAndActions(DataTransformFn):
     """Zero-pads states and actions to the model action dimension."""
 

@@ -32,6 +32,16 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Audio (speech) input support via Whisper encoder.
+    audio_enabled: bool = False
+    whisper_variant: str = "openai/whisper-large-v2"
+    audio_reduce_factor: int = 5
+
+    # Training stage for multi-stage audio pipeline.
+    # None = standard training, "asr_alignment" = Stage 1 embedding regression,
+    # "robot_task" = Stage 3 robot task training with audio/text mixing.
+    training_stage: str | None = None
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
@@ -49,12 +59,20 @@ class Pi0Config(_model.BaseModelConfig):
     def create(self, rng: at.KeyArrayLike) -> "Pi0":
         from openpi.models.pi0 import Pi0
 
-        return Pi0(self, rngs=nnx.Rngs(rng))
+        model = Pi0(self, rngs=nnx.Rngs(rng))
+        model._training_stage = self.training_stage
+        return model
 
     @override
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+
+        audio_spec = None
+        audio_mask_spec = None
+        if self.audio_enabled:
+            audio_spec = jax.ShapeDtypeStruct([batch_size, 80, 3000], jnp.float32)
+            audio_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         with at.disable_typechecking():
             observation_spec = _model.Observation(
@@ -71,6 +89,8 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                audio=audio_spec,
+                audio_mask=audio_mask_spec,
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 
@@ -103,6 +123,14 @@ class Pi0Config(_model.BaseModelConfig):
             filters.append(
                 nnx.Not(nnx_utils.PathRegex(".*lora.*")),
             )
+
+        # Always freeze whisper encoder params when audio is enabled.
+        if self.audio_enabled:
+            whisper_filter = nnx_utils.PathRegex(".*whisper_encoder.*")
+            if filters:
+                return nnx.Any(nnx.All(*filters), whisper_filter)
+            return whisper_filter
+
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)
