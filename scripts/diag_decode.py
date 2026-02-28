@@ -43,8 +43,13 @@ def load_model(config, checkpoint_path):
     return model
 
 
-CKPT = "checkpoints/pi05_audio_stage2_asr_finetune/stage2_asr_finetune/9999/params"
-DATA = "/home/user1/workspace/VLA/data/librispeech/LibriSpeech/train-clean-360"
+import argparse
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--checkpoint", default="checkpoints/pi05_audio_mixed_asr/mixed_asr/500/params")
+_parser.add_argument("--data-dir", default="/home/user1/workspace/VLA/data/librispeech/LibriSpeech/train-clean-360")
+_args = _parser.parse_args()
+CKPT = _args.checkpoint
+DATA = _args.data_dir
 
 config = pi0_config.Pi0Config(
     pi05=True, audio_enabled=True,
@@ -62,7 +67,7 @@ with sp_path.open("rb") as f:
 fe = WhisperFeatureExtractor.from_pretrained("openai/whisper-large-v2")
 
 dataset = LibriSpeechDataset(data_dir=DATA)
-indices = [0, 100, 500]  # 3 different samples
+indices = [0, 100, 500, 1000, 2000]  # 5 different samples
 
 for idx in indices:
     sample = dataset[idx]
@@ -154,5 +159,69 @@ for idx in indices:
 
     decoded = sp.decode(generated_ids[1:])
     log(f"  Full: {decoded}")
+
+# ===== Audio Ablation Test =====
+log(f"\n{'='*60}")
+log("AUDIO ABLATION TEST: real audio vs zero audio")
+log(f"{'='*60}")
+
+ablation_indices = [0, 100, 500, 1000, 2000]
+for idx in ablation_indices:
+    sample = dataset[idx]
+    text_gt = sample["prompt"]
+
+    waveform, _ = librosa.load(sample["audio_path"], sr=16000)
+    mel = fe(waveform, sampling_rate=16000, return_tensors="np").input_features[0]
+    mel_batch = jnp.array(mel[None].astype(np.float32))
+
+    # Real audio tokens
+    audio_hidden = jax.lax.stop_gradient(model.whisper_encoder(mel_batch, deterministic=True))
+    real_audio_tokens = model.audio_projector(audio_hidden)
+
+    # Zero audio tokens
+    zero_audio_tokens = jnp.zeros_like(real_audio_tokens)
+
+    # Prepare GT tokens for loss computation
+    cleaned = text_gt.strip().replace("_", " ").replace("\n", " ")
+    gt_tokens = sp.encode(cleaned, add_bos=True) + sp.encode("\n")
+    gt_tokens = gt_tokens[:20]
+
+    def compute_loss_with_audio(audio_toks):
+        tok_arr = jnp.array([gt_tokens], dtype=jnp.int32)
+        text_emb = jax.lax.stop_gradient(model.PaliGemma.llm(tok_arr, method="embed"))
+        na = audio_toks.shape[1]
+        nt = text_emb.shape[1]
+        tokens = jnp.concatenate([audio_toks, text_emb], axis=1)
+        im = jnp.ones((1, na + nt), dtype=jnp.bool_)
+        arm = jnp.concatenate([jnp.zeros(na, dtype=jnp.bool_), jnp.ones(nt, dtype=jnp.bool_)])
+        am = make_attn_mask(im, arm)
+        pos = jnp.arange(na + nt)[None]
+        (h, _), _ = model.PaliGemma.llm([tokens, None], positions=pos, mask=am, adarms_cond=[None, None])
+
+        # Compute CE loss at each text position
+        losses = []
+        for t in range(nt - 1):
+            p = na + t
+            logits = model.PaliGemma.llm(h[:, p:p+1, :], method="decode").astype(jnp.float32)[0, 0]
+            log_probs = jax.nn.log_softmax(logits)
+            target = gt_tokens[t + 1]
+            losses.append(-float(log_probs[target]))
+        return losses
+
+    real_losses = compute_loss_with_audio(real_audio_tokens)
+    zero_losses = compute_loss_with_audio(zero_audio_tokens)
+
+    real_mean = np.mean(real_losses)
+    zero_mean = np.mean(zero_losses)
+    delta = zero_mean - real_mean
+
+    # Position 0 (first text prediction after audio)
+    pos0_real = real_losses[0] if real_losses else float('nan')
+    pos0_zero = zero_losses[0] if zero_losses else float('nan')
+    pos0_delta = pos0_zero - pos0_real
+
+    log(f"\nSample {idx}: '{text_gt[:60]}...'")
+    log(f"  Mean loss:  real={real_mean:.4f}  zero={zero_mean:.4f}  delta={delta:+.4f}")
+    log(f"  Pos 0 loss: real={pos0_real:.4f}  zero={pos0_zero:.4f}  delta={pos0_delta:+.4f}")
 
 log("\nDone.")
