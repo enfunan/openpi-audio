@@ -43,12 +43,13 @@ def load_model(config, checkpoint_path):
     return model
 
 
-CKPT = "checkpoints/pi05_audio_stage1_asr/stage1_asr_ce_5k/4999/params"
-DATA = "/home/user1/workspace/VLA/data/librispeech/LibriSpeech/train-clean-100"
+CKPT = "checkpoints/pi05_audio_stage2_asr_finetune/stage2_asr_finetune/9999/params"
+DATA = "/home/user1/workspace/VLA/data/librispeech/LibriSpeech/train-clean-360"
 
 config = pi0_config.Pi0Config(
     pi05=True, audio_enabled=True,
     training_stage="asr_alignment", discrete_state_input=False,
+    paligemma_variant="gemma_2b_lora",
 )
 
 log("Loading model...")

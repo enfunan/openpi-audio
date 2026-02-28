@@ -98,6 +98,10 @@ class DataConfig:
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
 
+    # For mixed ASR dataset (repo_id="mixed_asr").
+    droid_tts_dir: str | None = None
+    librispeech_ratio: float = 0.25
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -533,6 +537,38 @@ class LibriSpeechDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class MixedASRDataConfig(DataConfigFactory):
+    """Data config for mixed ASR training (LibriSpeech + DROID TTS).
+
+    Combines real speech (LibriSpeech) with synthesized robot instructions (DROID TTS)
+    at a configurable ratio. Sampling is per-sample at runtime, not pre-mixed.
+    """
+
+    # Path to the LibriSpeech data split directory.
+    data_dir: str = ""
+    # Path to the DROID TTS output directory (must contain manifest.json).
+    droid_tts_dir: str = ""
+    # Fraction of samples drawn from LibriSpeech (rest from DROID TTS).
+    librispeech_ratio: float = 0.25
+    repo_id: str = "mixed_asr"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        assert isinstance(model_config, pi0_config.Pi0Config)
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return DataConfig(
+            repo_id="mixed_asr",
+            asset_id=None,
+            norm_stats=None,
+            model_transforms=model_transforms,
+            rlds_data_dir=self.data_dir,
+            droid_tts_dir=self.droid_tts_dir,
+            librispeech_ratio=self.librispeech_ratio,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -832,6 +868,55 @@ _CONFIGS = [
         log_interval=50,
         wandb_enabled=True,
         exp_name="joint_asr",
+    ),
+    # Mixed ASR: Joint projector + LoRA training on 25% LibriSpeech + 75% DROID TTS.
+    # Fresh random projector + LoRA on Gemma, ASR CE loss.
+    # DROID TTS provides robot-domain vocabulary; LibriSpeech provides speech diversity.
+    # Override --data.data-dir (LibriSpeech) and --data.droid-tts-dir at runtime.
+    TrainConfig(
+        name="pi05_audio_mixed_asr",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            audio_enabled=True,
+            training_stage="asr_alignment",
+            paligemma_variant="gemma_2b_lora",
+            discrete_state_input=False,
+        ),
+        data=MixedASRDataConfig(
+            data_dir="",  # Override via --data.data-dir /path/to/librispeech/train-clean-360
+            droid_tts_dir="",  # Override via --data.droid-tts-dir /path/to/droid_train
+            librispeech_ratio=0.25,
+        ),
+        # Load base checkpoint + Whisper weights. Fresh projector + LoRA from model init.
+        weight_loader=weight_loaders.CompositeWeightLoader(
+            loaders=(
+                weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+                weight_loaders.WhisperWeightLoader(),
+            ),
+        ),
+        # Freeze Gemma + action expert base weights, SigLIP, Whisper.
+        # Trainable: Gemma LoRA adapters + audio projector (fresh random init).
+        freeze_filter=nnx.Any(
+            nnx_utils.PathRegex(".*PaliGemma/img.*"),
+            nnx.All(
+                nnx_utils.PathRegex(".*llm.*"),
+                nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+            ),
+            nnx_utils.PathRegex(".*whisper_encoder.*"),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=2e-5,
+            decay_steps=7_500,
+            decay_lr=2e-6,
+        ),
+        ema_decay=None,
+        num_train_steps=7_500,
+        batch_size=32,
+        save_interval=500,
+        log_interval=50,
+        wandb_enabled=True,
+        exp_name="mixed_asr",
     ),
     # Stage 3: Robot task training with LoRA + audio/text mixing (60/40).
     # Loads Stage 2 checkpoint (Gemma LoRA adapted to audio).

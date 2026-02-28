@@ -187,13 +187,33 @@ Stage 1 learned a coarse distribution match. Stage 2's ASR cross-entropy loss pr
 - **Checkpoints**: Every 500 steps (for early stopping if needed).
 - **Freeze filter**: `Any(PaliGemma/img, All(llm, Not(lora)), whisper_encoder)` — freezes SigLIP image encoder, Gemma base weights, Whisper encoder. Trains LoRA adapters + audio projector.
 
-### Early Training Results
+### Training Results — FAILED
 
 - Step 0: loss=9.59, grad_norm=238.6 (below random chance ~12.5, confirming Stage 1 provides useful initialization)
 - Step 100: loss=7.86, grad_norm=29.1 (rapid improvement during warmup)
-- Step 200: loss=7.10 (steady decrease)
-- Step 400: loss=6.61 (continuing to drop)
-- Speed: ~1.7 it/s, ETA ~1h 36m for 10k steps
+- Step 5000: loss plateaued at ~5.6, grad_norm stable at ~2.3
+- Step 10000: loss still ~5.6 (no improvement in second half of training)
+
+### Post-Training Diagnostics
+
+Ran `scripts/diag_decode.py` on the 10k-step checkpoint:
+
+- **Greedy decode identical for all samples**: Every audio sample produces "Sub" as top-1 prediction (p=0.28-0.37)
+- **Target word probabilities near-zero**: The model never learned to decode audio content into correct text
+- **Same collapse pattern as Stage 1 v1**: Despite LoRA, Gemma still can't extract meaningful per-sample information from audio tokens
+
+### Why It Failed
+
+1. **Starting from collapsed projector**: Stage 1 v2's projector learned the right direction but collapsed to a single centroid. Starting from this gave LoRA only a uniform signal to work with.
+2. **LibriSpeech-only data**: No robot-domain vocabulary. The projector never saw the kind of text it would need for downstream robot tasks.
+3. **LoRA rank-16 may be too constrained**: Small rank limits how much Gemma can adapt its attention patterns to process audio tokens.
+
+### Decision: Restart with Fresh Init + Mixed Data
+
+Rather than trying to salvage Stage 2 v1, we pivoted to a joint training approach:
+- **Fresh random projector + fresh LoRA** (not loaded from any failed checkpoint)
+- **Mixed data**: 25% LibriSpeech + 75% DROID TTS robot instructions
+- This is conceptually Stage 2 v2, configured as `pi05_audio_mixed_asr`
 
 ## 6. Critical Bug: Audio/Text Mutual Exclusivity
 
@@ -252,11 +272,30 @@ We decided on a mixed dataset for Stage 2:
 
 **Why 25/75 by sample count?** LibriSpeech utterances are ~3.4x longer than DROID commands. At 25/75 sample ratio, the **token exposure** is roughly balanced: 25% × 45 tokens ≈ 75% × 14 tokens. This ensures the model spends equal learning time on acoustic diversity and domain-relevant vocabulary.
 
-### TTS Voice Plan
+### TTS Voice Plan — IMPLEMENTED
 
-- **DROID**: 10 voices (5 male, 5 female) — enough diversity for 314k samples without excessive synthesis time (~13 hours)
-- **LIBERO**: 20 voices (10 male, 10 female) — more voices for only 130 unique instructions × 20 = 2,600 samples (30 min synthesis)
-- **Engine**: edge-tts (Microsoft Azure, free, 60+ English voices with varied accents)
+We evaluated 5 TTS engines (Piper, Kokoro, XTTS v2, StyleTTS2, edge-tts) and chose a three-way accent split:
+
+| Dataset | Files | Engine | Voices | Accent | Synthesis Time |
+|---------|-------|--------|--------|--------|----------------|
+| DROID train | 30,000 .mp3 | edge-tts | 3 American (Aria, Guy, Jenny) | US English | ~13 min (concurrency=32) |
+| LIBERO train | 2,240 .wav | Piper VCTK | 20 speakers | Multi-accent (UK, Indian, etc.) | ~14 min |
+| LIBERO eval | 1,120 .mp3 | edge-tts | 10 voices | Held-out (GB/AU/IN/IE/ZA) | ~5 min |
+
+**Why three-way accent split?**
+- Train and eval use **strictly different voices** — no speaker leakage
+- DROID train uses American English (majority accent in LibriTTS-R, consistent with LibriSpeech)
+- LIBERO train uses multi-accent VCTK (109 speakers, 13 accent categories)
+- LIBERO eval uses held-out accent-region voices (GB, AU, IN, IE, ZA) to test generalization
+
+**Initial plan was 10 voices × 31.4k DROID instructions = 314k files** but:
+- Piper (libritts_r, 904 speakers) was too slow: 1.7 files/s vs advertised ~80 files/s. Would take ~16 hours.
+- Vocabulary analysis showed diminishing returns after 5k instructions (93% LIBERO coverage at 1k)
+- Reduced to 10k instructions × 3 edge-tts voices = 30k files, sufficient for 75% of mixed dataset
+
+**edge-tts concurrency optimization**: Benchmarked at 8/16/24/32/48 concurrent connections. Network-latency bound (~1.1s per request). Optimal at concurrency=32 (24 files/s), 3.4x faster than default 8. Plateaus at 48 due to connection resets.
+
+All TTS data stored under `/home/user1/workspace/VLA/data/tts/` with `manifest.json` per dataset.
 
 ## 8. Stage 3: Robot Task Training — The Hardest Design Decision
 
@@ -408,44 +447,70 @@ Stage 1 v2 MSE plateaued at ~0.21 and the projector collapsed to a single direct
 | Key challenge | None major (LLaMA is unbiased) | PaliGemma has strong multimodal bias |
 | Action generation | Direct token prediction | Flow matching (continuous actions) |
 | Training data | BridgeData V2 | LIBERO (130 tasks) |
-| TTS voices | Not specified | 20 voices for LIBERO, 10 for DROID |
+| ASR training data | LibriSpeech only | 25% LibriSpeech + 75% DROID TTS (robot domain) |
+| TTS voices | Not specified | 3 American (DROID), 20 multi-accent (LIBERO train), 10 held-out (LIBERO eval) |
+| TTS engine | Not specified | edge-tts (DROID, eval) + Piper VCTK (LIBERO train) |
 
 The core architectural difference — PaliGemma's multimodal fine-tuning vs LLaMA's text-only pretraining — forced us to develop a fundamentally different Stage 1 approach and use LoRA instead of full fine-tuning throughout.
 
 ## 11. Complete Training Plan
 
-### Phase 1: TTS Synthesis (~14 hours)
-1. Synthesize DROID TTS: 31,420 instructions × 10 voices = 314,000 audio files
-2. Synthesize LIBERO TTS: 130 instructions × 20 voices = 2,600 audio files
-3. Generate manifests mapping prompt → list of audio file paths
+### Phase 1: TTS Synthesis — COMPLETE
+| Dataset | Status | Files | Time |
+|---------|--------|-------|------|
+| DROID train (edge-tts) | DONE | 30,000 .mp3, 0 failed | 13 min |
+| LIBERO train (Piper VCTK) | DONE | 2,240 .wav, 0 failed | 14 min |
+| LIBERO eval (edge-tts) | DONE | 1,120 .mp3, 0 failed | 5 min |
 
-### Phase 2: Stage 2 — ASR Training (current: LibriSpeech only; future: mixed)
-**Current run** (in progress):
-- Config: `pi05_audio_stage2_asr_finetune`
-- Data: LibriSpeech train-clean-360 only
-- 10k steps, batch 32, LR 2e-5→2e-6
+### Phase 2: Stage 2 — Mixed ASR Training — READY TO LAUNCH
 
-**Future run** (after TTS synthesis):
-- Config: `pi05_audio_joint_asr` (modified for mixed dataset)
-- Data: 25% LibriSpeech train-clean-360 + 75% DROID TTS
-- 7,500 steps, batch 32
+**Previous attempt (FAILED)**: `pi05_audio_stage2_asr_finetune` on LibriSpeech-only, loss plateaued at 5.6, greedy decode collapsed.
+
+**Current plan**: `pi05_audio_mixed_asr`
+- Data: 25% LibriSpeech train-clean-360 (97k) + 75% DROID TTS (30k) = 127,243 total
+- Fresh random projector + fresh LoRA (verified: 0 projector/LoRA keys in base checkpoint)
+- 7,500 steps, batch 32, LR cosine 2e-5→2e-6, warmup 500
+- MixedASRDataset: runtime per-sample Bernoulli sampling (verified 23.7%/76.3% ratio)
+- Checkpoint: `checkpoints/pi05_audio_mixed_asr/mixed_asr_7500/`
+
+**Sanity checks completed**:
+1. Config loads correctly with all fields
+2. Dataset ratio verified (23.7% LibriSpeech / 76.3% DROID over 1000 samples)
+3. Weight init: 0 audio_projector + 0 LoRA keys in base Pi0.5 checkpoint → fresh random init
+
+**Launch command**:
+```bash
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 .venv/bin/python scripts/train.py pi05_audio_mixed_asr \
+  --data.data-dir=/home/user1/workspace/VLA/data/librispeech/LibriSpeech/train-clean-360 \
+  --data.droid-tts-dir=/home/user1/workspace/VLA/data/tts/droid_train \
+  --no-wandb-enabled --exp-name=mixed_asr_7500
+```
 
 **Go/no-go criteria before Stage 3**:
 - Loss below 4.0 (well below random chance ~12.5)
 - `scripts/diag_decode.py` shows varied greedy decode output across different audio samples
-- Audio token norms in Gemma's expected range (~40-60)
+- Audio token norms in Gemma's expected range
 
 ### Phase 3: Stage 3 — LIBERO Robot Training
 - Config: `pi05_audio_stage3_libero`
-- Data: LIBERO (all 130 tasks), 60/40 audio/text mixing
+- Data: LIBERO (all 130 tasks), 60/40 audio/text mixing with `--data.tts-cache-dir` and `--data.audio-ratio=0.6`
 - Trainable: Gemma LoRA + action expert LoRA + action head + audio projector (10x lower LR)
-- 30k steps, batch 32, LR 2e-5→2e-6
+- 30k steps, batch 32, LR 2e-5→2e-6, gradient clipping 1.0
+- **TODO**: Update `weight_loader` path to Stage 2 mixed ASR output checkpoint
+
+**Launch command** (after updating weight_loader path):
+```bash
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 .venv/bin/python scripts/train.py pi05_audio_stage3_libero \
+  --data.tts-cache-dir=/home/user1/workspace/VLA/data/tts/libero_train \
+  --data.audio-ratio=0.6 \
+  --no-wandb-enabled --exp-name=stage3_libero
+```
 
 **Validation checkpoints**: Eval every 5k steps with `examples/libero/main.py --eval-mode both`
 
 ### Phase 4: Evaluation
 - `examples/libero/main.py --eval-mode text` (text-only baseline)
-- `examples/libero/main.py --eval-mode audio` (audio-only)
+- `examples/libero/main.py --eval-mode audio --audio-dir /home/user1/workspace/VLA/data/tts/libero_eval` (audio-only, held-out accents)
 - `examples/libero/main.py --eval-mode both` (mixed)
 - Compare success rates across all 130 tasks
 
@@ -492,9 +557,11 @@ This is mathematically equivalent to per-parameter LR groups but requires only 3
 6. **Stage 1 v2 training**: Loss drops fast, plateaus at ~0.21
 7. **Stage 1 v2 diagnostics**: Discovered projector collapse (single centroid direction). Attempted InfoNCE fix — failed because Gemma text embeddings are too similar (cosine > 0.995). Added learnable output scale (2.4x) to close norm gap.
 8. **Stage 2 + 3 config design**: Deep analysis of Pi0.5 attention sharing, chose LoRA + freeze strategy
-9. **Stage 2 training**: Started ASR fine-tune with LoRA. Loss dropping steadily (9.59 → 6.61 in 400 steps).
+9. **Stage 2 v1 training (FAILED)**: ASR fine-tune on LibriSpeech-only. Loss plateaued at 5.6 after 10k steps, greedy decode identical for all samples. LoRA rank-16 on LibriSpeech-only insufficient.
 10. **Audio/text mutual exclusivity bug**: Discovered and fixed — AudioTextMixingTransform now removes text when audio is assigned, following VLAS design.
 11. **Training data strategy**: Analyzed DROID annotations (31.4k unique instructions), decided on 25% LibriSpeech + 75% DROID TTS mixing for improved domain coverage.
 12. **LIBERO visual ambiguity analysis**: 92% of tasks share scenes → instruction is essential → audio ignorability risk is low.
 13. **Stage 3 config finalized**: Projector unfrozen at 10x lower LR via gradient scaling. Per-parameter LR implemented as `lr_scale_overrides` on TrainConfig.
-14. **Complete training plan approved**: TTS synthesis → Stage 2 (mixed ASR) → Stage 3 (LIBERO) → evaluation.
+14. **TTS synthesis — COMPLETE**: Evaluated 5 engines (Piper, Kokoro, XTTS v2, StyleTTS2, edge-tts). Implemented three-way accent split: DROID train (edge-tts, 30k files), LIBERO train (Piper VCTK, 2,240 files), LIBERO eval (edge-tts held-out accents, 1,120 files). Optimized edge-tts from 7.5 files/s (concurrency 8) to 24 files/s (concurrency 32).
+15. **Mixed ASR dataset — IMPLEMENTED**: `MixedASRDataset` class with per-sample Bernoulli sampling. `MixedASRDataConfig` + `pi05_audio_mixed_asr` training config. Data loader routing for `repo_id="mixed_asr"`. Sanity checked: ratio 23.7%/76.3%, fresh projector+LoRA init confirmed.
+16. **Stage 2 v2 (mixed ASR) — READY TO LAUNCH**: Awaiting go-ahead. Fresh projector + LoRA, 25% LibriSpeech + 75% DROID TTS, 7,500 steps.
