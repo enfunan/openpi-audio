@@ -178,13 +178,83 @@ Despite passing all go/no-go criteria, the per-sample discrimination was deemed 
 
 ---
 
-## 5. Extended Training (Steps 7500–15000)
+## 5. Extended Training Results (Steps 7500–15000)
 
-*Results to be added after training completes.*
+### Training Curve (extended)
 
-- **Resumed from**: step 7499 checkpoint
-- **tmux**: `mixed_asr`, **log**: `logs/stage2_mixed_asr_15k.log`
-- **Stage 3 weight_loader**: Updated to `./checkpoints/pi05_audio_mixed_asr/mixed_asr/14999/params`
+| Step | Loss | Grad Norm |
+|------|------|-----------|
+| 7500 | 4.67 | 6.7 (first step after resume) |
+| 8000 | 3.82 | 7.9 |
+| 9450 | 3.45 | 7.4 |
+| 14850 | 3.32 | 8.3 |
+| 14950 | 3.43 | 8.0 |
+
+Loss continued decreasing: 3.65 (step 7499) → 3.43 (step 14999). Total training time: ~148 min.
+
+### Step 14999 Diagnostics
+
+**Greedy decode**:
+| Sample | GT | Decode |
+|--------|-----|--------|
+| 0 | "tom the piper's son" | "and the other thing" |
+| 100 | "when i heard him preach..." | "and the other man had been a man of the" |
+| 500 | "the rusty bolt was shot back..." | "the man had been a man of the same nature" |
+| 1000 | "the implication of howard's..." | "and the other of the other the other of the" |
+| 2000 | "the live light strikes..." | "and the other of the other the other of the" |
+
+Samples 1000/2000 still identical. 3/5 unique outputs (same as step 7499).
+
+**Audio ablation (step 14999)**:
+| Sample | Real audio loss | Zero audio loss | Delta |
+|--------|----------------|----------------|-------|
+| 0 | 7.01 | 13.65 | +6.63 |
+| 100 | 6.18 | 10.51 | +4.33 |
+| 500 | 6.65 | 12.29 | +5.64 |
+| 1000 | 6.18 | 11.06 | +4.88 |
+| 2000 | 7.60 | 14.59 | +6.99 |
+| **Avg** | **6.72** | **12.42** | **+5.70** |
+
+**Position 0 ablation (step 14999)**:
+| Sample | Real | Zero | Delta |
+|--------|------|------|-------|
+| 0 | 12.26 | 20.71 | +8.44 |
+| 100 | 4.90 | 24.03 | +19.13 |
+| 500 | 2.33 | 23.71 | +21.38 |
+| 1000 | 3.04 | 23.71 | +20.67 |
+| 2000 | 2.55 | 23.71 | +21.16 |
+| **Avg** | **5.02** | **23.17** | **+18.16** |
+
+**Audio token norms**: ~162 (up from 152 at step 7499)
+
+### Full Comparison: Step 500 → 7499 → 14999
+
+| Metric | Step 500 | Step 7499 | Step 14999 | Trend |
+|--------|---------|----------|-----------|-------|
+| Loss | 5.41 | 3.65 | **3.43** | Improving |
+| Mean ablation delta | +5.80 | +5.79 | **+5.70** | Flat |
+| Mean pos 0 delta | +17.85 | +18.43 | **+18.16** | Flat |
+| Audio token norm | 83.5 | 152.1 | **162.0** | Slow growth |
+| Unique greedy outputs | 5/5 | 3/5 | **3/5** | Flat |
+
+### Conclusion
+
+**Extending to 15k did NOT meaningfully improve per-sample discrimination:**
+- Ablation deltas unchanged (~5.7 since step 500)
+- Unique outputs unchanged (3/5 since step 7499)
+- Norms grew marginally (152→162, still far from text ~240)
+- Loss improved (3.65→3.43) but reflects better language modeling, not better audio discrimination
+
+**The model has converged on its audio representation quality.** Further Stage 2 training shows diminishing returns. The audio processing infrastructure is functional — audio is strongly used for conditioning (+5.7 mean delta, +18.2 pos 0 delta) — but per-sample ASR discrimination is limited by the architecture/data.
+
+**Decision: Proceed to Stage 3.** Stage 3's flow matching loss provides a fundamentally different learning signal (action prediction conditioned on audio) which may drive further audio-to-task discrimination that ASR CE loss alone cannot achieve.
+
+---
+
+## 6. Stage 3 Readiness
+
+- **Checkpoint**: `checkpoints/pi05_audio_mixed_asr/mixed_asr/14999/params`
+- **Stage 3 weight_loader**: Points to `./checkpoints/pi05_audio_mixed_asr/mixed_asr/14999/params`
 - **Config**: `pi05_audio_stage3_libero` — ready
 - **TTS data**: LIBERO train (2,240 files), LIBERO eval (1,120 files) — ready
-- **Estimated Stage 3 time**: ~7-8 hours (30k steps × ~0.8-1.0 s/step)
+- **Estimated time**: ~7-8 hours (30k steps × ~0.8-1.0 s/step)
