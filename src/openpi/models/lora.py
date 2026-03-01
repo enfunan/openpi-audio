@@ -58,9 +58,12 @@ class Einsum(nn.Module):
 
         if config := self.lora_config:
             eqn_a, eqn_b = self._make_lora_eqns(eqn)
-            lora = jnp.einsum(eqn_a, x, self.w_a.astype(dtype))
-            lora = jnp.einsum(eqn_b, lora, self.w_b.astype(dtype))
-            result = result + lora * config.scaling_value
+            # Compute LoRA in float32 to prevent bfloat16 gradient overflow
+            # during backward pass through transformer layers.
+            x_f32 = x.astype(jnp.float32)
+            lora = jnp.einsum(eqn_a, x_f32, self.w_a.astype(jnp.float32))
+            lora = jnp.einsum(eqn_b, lora, self.w_b.astype(jnp.float32))
+            result = result + (lora * config.scaling_value).astype(dtype)
 
         return result
 
@@ -145,4 +148,7 @@ class FeedForward(nn.Module):
         base = jnp.dot(x, w.astype(x.dtype))
         if lora_weights is None:
             return base
-        return base + jnp.dot(jnp.dot(x, lora_weights[0].astype(x.dtype)), lora_weights[1].astype(x.dtype))
+        # Compute LoRA in float32 to prevent bfloat16 gradient overflow.
+        x_f32 = x.astype(jnp.float32)
+        lora = jnp.dot(jnp.dot(x_f32, lora_weights[0].astype(jnp.float32)), lora_weights[1].astype(jnp.float32))
+        return base + lora.astype(x.dtype)

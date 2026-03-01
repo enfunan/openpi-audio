@@ -564,4 +564,156 @@ This is mathematically equivalent to per-parameter LR groups but requires only 3
 13. **Stage 3 config finalized**: Projector unfrozen at 10x lower LR via gradient scaling. Per-parameter LR implemented as `lr_scale_overrides` on TrainConfig.
 14. **TTS synthesis — COMPLETE**: Evaluated 5 engines (Piper, Kokoro, XTTS v2, StyleTTS2, edge-tts). Implemented three-way accent split: DROID train (edge-tts, 30k files), LIBERO train (Piper VCTK, 2,240 files), LIBERO eval (edge-tts held-out accents, 1,120 files). Optimized edge-tts from 7.5 files/s (concurrency 8) to 24 files/s (concurrency 32).
 15. **Mixed ASR dataset — IMPLEMENTED**: `MixedASRDataset` class with per-sample Bernoulli sampling. `MixedASRDataConfig` + `pi05_audio_mixed_asr` training config. Data loader routing for `repo_id="mixed_asr"`. Sanity checked: ratio 23.7%/76.3%, fresh projector+LoRA init confirmed.
-16. **Stage 2 v2 (mixed ASR) — READY TO LAUNCH**: Awaiting go-ahead. Fresh projector + LoRA, 25% LibriSpeech + 75% DROID TTS, 7,500 steps.
+16. **Stage 2 v2 (mixed ASR) — COMPLETE**: 15k steps. Loss 3.43, never plateaued. Audio ablation +5.70 mean delta. 3/5 unique greedy decodes. Checkpoint `mixed_asr/14999/params`.
+17. **Stage 3 launch attempt — NaN at step 3**: Deterministic NaN in SigLIP output on all 3 cameras. Extensive investigation documented in Section 14.
+
+## 14. Stage 3 NaN Investigation (Unsolved)
+
+### The Problem
+
+Stage 3 LIBERO training (`pi05_audio_stage3_libero`, flow matching loss) produces NaN deterministically at step 3:
+
+```
+Step 0: loss=0.0921, grad_norm=0.1595   ← clean
+Step 1: loss=0.0926, grad_norm=0.2128   ← clean
+Step 2: loss=0.0928, grad_norm=0.1634   ← clean
+Step 3: loss=NaN,    grad_norm=NaN      ← all 3 cameras NaN
+```
+
+- Same behavior every run with the same seed
+- Audio tokens and text tokens remain clean at step 3
+- All 3 cameras (base_image, left_wrist_image, right_wrist_image) NaN simultaneously
+
+### NaN Location
+
+The NaN originates **inside SigLIP's forward pass** (`_Module.__call__` in `siglip.py`). Verified by printing per-component outputs:
+
+```
+Step 3 debugging output:
+  raw_img base_image:        nan=False inf=False min=-1.0 max=1.0   ← clean input
+  raw_img left_wrist_image:  nan=False inf=False min=-1.0 max=1.0   ← clean input
+  raw_img right_wrist_image: nan=False inf=False min=-1.0 max=1.0   ← clean input
+  img base_image:        nan=True    ← NaN output!
+  img left_wrist_image:  nan=True    ← NaN output!
+  img right_wrist_image: nan=True    ← NaN output!
+  audio: nan=False                   ← audio is fine
+  text:  nan=False                   ← text is fine
+```
+
+Clean images go in, NaN comes out of SigLIP.
+
+### Systematic Hypotheses Tested
+
+Every hypothesis below was tested by modifying exactly one variable, running 5 steps with `log_interval=1`, and checking whether NaN still appears at step 3.
+
+#### Hypothesis 1: bfloat16 softmax overflow in SigLIP attention
+
+**Rationale**: SigLIP uses `dtype_mm="bfloat16"` for attention. bfloat16 has max value 3.39e+38 but only 7 bits of mantissa — attention logits could overflow during softmax.
+
+**Test**: Set `force_fp32_for_softmax=True` on `nn.MultiHeadDotProductAttention` in `siglip.py:Encoder1DBlock`. This upcasts attention weights to float32 before softmax while keeping everything else in bfloat16.
+
+**Result**: Still NaN at step 3. Softmax overflow is NOT the cause.
+
+#### Hypothesis 2: bfloat16 QK dot product overflow
+
+**Rationale**: Even with float32 softmax, the QK dot product itself is computed in bfloat16. A single large attention logit could overflow bfloat16 range before reaching softmax.
+
+**Test**: Changed `dtype_mm="float32"` for the entire SigLIP at construction time in `pi0.py`. This makes ALL computation in SigLIP (QK, softmax, MLP, LayerNorm) run in float32. Verified that this doesn't change param shapes (23 SigLIP params, same shapes as checkpoint).
+
+**Result**: Still NaN at step 3. Even full float32 SigLIP produces NaN on step 3's images.
+
+#### Hypothesis 3: Remat (gradient checkpointing) recomputation bug
+
+**Rationale**: SigLIP uses `nn.remat(policy=nothing_saveable)` which discards all intermediate activations and recomputes them during the backward pass. If recomputation diverges from the forward pass (e.g., due to non-deterministic operations or numerical instability amplified on the second pass), it could produce NaN in gradients.
+
+**Test**: Changed `remat_policy="everything_saveable"` which saves all intermediates, effectively disabling remat recomputation while keeping `nn.scan` structure.
+
+Note: We could not use `scan=False` because that changes the param tree structure from 1 scanned `encoderblock` with stacked params to 27 separate `encoderblock_N` — incompatible with the checkpoint.
+
+**Result**: Still NaN at step 3. Remat recomputation is NOT the cause.
+
+#### Hypothesis 4: Backward pass through frozen SigLIP causes NaN
+
+**Rationale**: Even though SigLIP params are frozen, gradients still flow *through* it during backprop (to the LoRA layers downstream). The backward pass through 27 transformer layers could accumulate numerical errors.
+
+**Test**: Added `jax.lax.stop_gradient(image_tokens)` after SigLIP's forward pass + cast to float32, in `embed_prefix`. This completely blocks all gradient flow through SigLIP.
+
+**Result**: Still NaN at step 3. The backward pass is NOT the cause — NaN is generated during the forward pass.
+
+#### Hypothesis 5: Corrupt or NaN input images from data pipeline
+
+**Rationale**: Perhaps the data pipeline produces NaN or Inf values in pixel data at step 3.
+
+**Test**: Added `jax.debug.print` inside `embed_prefix` to check raw images for NaN, Inf, min, and max values before any processing.
+
+**Result**: All images at step 3 are clean — no NaN, no Inf, range [-1.0, 1.0]. The data pipeline is fine.
+
+#### Hypothesis 6: Corrupt checkpoint parameters
+
+**Rationale**: Perhaps some SigLIP params in the Stage 2 checkpoint contain NaN or extreme values.
+
+**Test**: Verified all 556 params in the checkpoint. 23 SigLIP params, all shapes match expected, no NaN found. Also ran `compute_loss` on synthetic dummy data — clean loss (0.037).
+
+**Result**: Checkpoint is clean. SigLIP params are valid.
+
+### What We Know For Certain
+
+1. **NaN is generated inside SigLIP's forward pass** (not backward, not data, not checkpoint)
+2. **Even float32 SigLIP with no remat produces NaN** on step 3's batch
+3. **All 3 cameras NaN simultaneously** at step 3 — the same batch affects all cameras
+4. **Steps 0-2 use the same SigLIP (frozen) and succeed** — the NaN is input-dependent
+5. **Audio and text are clean at step 3** — only image processing is affected
+6. **The NaN is deterministic** — same seed, same step 3
+
+### Leading Hypothesis: Per-Sample Pathological Image
+
+The batch has 32 samples. Our debugging checks `jnp.any(jnp.isnan(...))` and `jnp.min/max(...)` across the **entire batch** — these aggregate statistics could mask a single problematic sample.
+
+If one sample has a near-uniform image (very low pixel variance), the sequence of operations in SigLIP could amplify it:
+
+1. **Patch extraction** (Conv): Near-uniform image → near-zero patch features
+2. **LayerNorm**: Near-zero variance → divide by epsilon (~1e-6) → amplified noise → extreme values
+3. **Self-attention**: Extreme Q/K values → extreme attention logits → NaN even in float32
+4. **27 transformer layers**: Each layer's LayerNorm + attention amplifies the instability
+
+This would explain why:
+- Float32 doesn't help (it's not a precision issue, it's an amplification issue)
+- All 3 cameras NaN simultaneously (one sample's NaN propagates through batch operations like `jnp.mean`)
+- Steps 0-2 work fine (different batches, no pathological samples)
+- Dummy data works fine (synthetic data doesn't have this pathology)
+
+### What the Official Config Does Differently
+
+We checked the official `pi0_libero_low_mem_finetune` config. Key difference: **it does NOT freeze SigLIP**. Its freeze filter is:
+```python
+nnx.All(nnx_utils.PathRegex(".*llm.*"), nnx.Not(nnx_utils.PathRegex(".*lora.*")))
+```
+This only matches LLM parameters, leaving SigLIP fully trainable. When SigLIP is trainable, its parameters adapt to the data distribution during training, preventing pathological responses to unusual inputs. Our config freezes SigLIP (`.*PaliGemma/img.*`), keeping it fixed at its pre-trained state which may not be robust to all LIBERO images.
+
+### Precision Context
+
+For reference, here is how each component handles precision:
+
+| Component | Forward Precision | Attention QK | Softmax |
+|-----------|------------------|-------------|---------|
+| Gemma | bfloat16 weights, float32 QK | `preferred_element_type=float32` | float32 (via QK) |
+| SigLIP (default) | bfloat16 | bfloat16 | bfloat16 |
+| SigLIP (our test) | float32 | float32 | float32 |
+
+Note: Gemma explicitly upcasts QK dot product to float32 via `preferred_element_type=jnp.float32` on the einsum (gemma.py:217). SigLIP has no such upcast.
+
+### Next Steps
+
+1. **Print per-sample image variance** for step 3's batch to identify the problematic sample(s)
+2. **Check per-sample SigLIP output** (not batch aggregates) to confirm single-sample NaN
+3. If confirmed: add per-sample image variance check + clamp/skip bad samples
+4. Alternative: unfreeze SigLIP (matching official config), which may self-correct
+
+### Current Code State
+
+The following experimental changes remain in `pi0.py` and should be reverted once the root cause is confirmed and fixed:
+- `dtype_mm="float32"` on SigLIP construction (line ~134) — was `config.dtype` (bfloat16)
+- `remat_policy="everything_saveable"` (line ~136) — was default `"nothing_saveable"`
+- 8 `jax.debug.print` statements throughout `embed_prefix` and `compute_loss`
+
+`siglip.py` and `train.py` are clean (no experimental changes remaining).
