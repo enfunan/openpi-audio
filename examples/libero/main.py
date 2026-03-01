@@ -193,9 +193,11 @@ def eval_libero(args: Args) -> None:
                                 "prompt": str(task_description),
                             }
 
-                            # Inject audio waveform when in audio mode
+                            # Inject audio waveform when in audio mode.
+                            # Clear text prompt to match training (VLAS mutual exclusivity).
                             if use_audio and audio_waveform is not None:
                                 element["audio"] = audio_waveform
+                                element["prompt"] = ""
 
                             # Query model to get action
                             action_chunk = client.infer(element)["actions"]

@@ -1006,18 +1006,14 @@ _CONFIGS = [
             ),
             nnx_utils.PathRegex(".*whisper_encoder.*"),
         ),
-        # Per-component LR scaling to protect Stage 2 audio representations:
-        #   Action expert LoRA (fresh init): 1.0x (2e-5) — learn from scratch
-        #   Gemma LoRA (Stage 2 trained):    0.3x (6e-6) — adapt slowly, preserve audio
-        #   Audio projector (Stage 2 trained): 0.1x (2e-6) — fine-tune gently
-        # Gemma LoRA: attn einsums without _1 suffix + mlp (not mlp_1).
-        # AE LoRA uses q_einsum_1/kv_einsum_1/attn_vec_einsum_1 and mlp_1.
+        # LR scaling: audio projector 0.1x, Gemma LoRA 0.5x (preserve Stage 2 audio knowledge).
+        # AE LoRA at full LR (fresh init). Regex matches Gemma einsums (no _1 suffix) + mlp (not mlp_1).
         lr_scale_overrides={
             nnx_utils.PathRegex(".*audio_projector.*"): 0.1,
-            nnx_utils.PathRegex(r".*/attn/(q_einsum|kv_einsum|attn_vec_einsum)/lora_[ab]|.*/mlp/.*lora.*"): 0.3,
+            nnx_utils.PathRegex(r".*/attn/(q_einsum|kv_einsum|attn_vec_einsum)/lora_[ab]|.*/mlp/.*lora.*"): 0.5,
         },
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=5_000,
+            warmup_steps=1_000,
             peak_lr=2e-5,
             decay_steps=30_000,
             decay_lr=2e-6,
@@ -1027,7 +1023,7 @@ _CONFIGS = [
         num_train_steps=30_000,
         batch_size=32,
         save_interval=1_000,
-        log_interval=10,
+        log_interval=50,
         wandb_enabled=True,
         exp_name="stage3_libero",
     ),
