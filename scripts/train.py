@@ -173,9 +173,22 @@ def train_step(
     for filt, scale in config.lr_scale_overrides.items():
         grads = nnx_utils.state_map(grads, filt, lambda p: p.replace(p.value * scale))
 
+    grad_norm = optax.global_norm(grads)
+    grad_finite = jnp.isfinite(grad_norm)
+
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
     new_params = optax.apply_updates(params, updates)
+
+    # NaN gradient guard: skip parameter update when gradients contain NaN/Inf.
+    # bfloat16 forward pass can overflow on certain batches; discarding the step
+    # is safer than corrupting all parameters with a NaN update.
+    new_params = jax.tree.map(
+        lambda new, old: jnp.where(grad_finite, new, old), new_params, params
+    )
+    new_opt_state = jax.tree.map(
+        lambda new, old: jnp.where(grad_finite, new, old), new_opt_state, state.opt_state
+    )
 
     # Update the model in place and return the new full state.
     nnx.update(model, new_params)
@@ -201,8 +214,9 @@ def train_step(
     )
     info = {
         "loss": loss,
-        "grad_norm": optax.global_norm(grads),
+        "grad_norm": grad_norm,
         "param_norm": optax.global_norm(kernel_params),
+        "nan_skipped": jnp.where(grad_finite, 0.0, 1.0),
     }
     return new_state, info
 

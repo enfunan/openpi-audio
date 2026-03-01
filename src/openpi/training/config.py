@@ -1022,6 +1022,7 @@ _CONFIGS = [
         ema_decay=None,
         num_train_steps=30_000,
         batch_size=32,
+        num_workers=0,  # Multi-worker librosa/Whisper causes shared memory corruption.
         save_interval=1_000,
         log_interval=50,
         wandb_enabled=True,

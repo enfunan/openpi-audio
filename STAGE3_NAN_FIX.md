@@ -45,29 +45,25 @@ Same behavior every run with the same seed. All 3 cameras NaN simultaneously.
 **Test**: Verified all 556 params (23 SigLIP). Ran `compute_loss` on synthetic dummy data.
 **Result**: Checkpoint clean, dummy data produces clean loss (0.037).
 
-## The Misleading Trail
+## Two Root Causes
 
-The NaN appeared to come from SigLIP's forward pass because `jax.debug.print` showed clean images going in and NaN image tokens coming out. This led to 4 hypotheses focused on SigLIP internals — all dead ends.
+The NaN problem had **two independent causes**, both related to bfloat16 numerical limits.
 
-The key insight was that SigLIP is **frozen** and produces the same output for the same input regardless of training. If SigLIP itself were broken, it would NaN on step 0 too. The NaN at step 3 means something **changed between step 0 and step 3** — and the only thing changing is the **trainable parameters** (LoRA weights).
+### Root Cause 1: bfloat16 LoRA Gradient Overflow
 
-## Root Cause: bfloat16 Gradient Overflow in LoRA
+**Fix**: Float32 LoRA computation in `lora.py`.
 
-The actual problem was **bfloat16 gradient overflow in the LoRA backward pass** through Gemma's 18 transformer layers.
+The initial NaN appeared to come from SigLIP's forward pass because `jax.debug.print` showed clean images going in and NaN image tokens coming out. This led to 4 hypotheses focused on SigLIP internals — all dead ends.
 
-### Why it happens
+The key insight: SigLIP is **frozen** and produces the same output for the same input. If SigLIP itself were broken, it would NaN on step 0 too. The NaN at step 3 means the **trainable parameters** (LoRA weights) got corrupted by a NaN gradient update, and the corrupted weights produced NaN in the next forward pass.
 
-1. Stage 3 uses flow matching loss with random Gaussian noise (std=1.0) as the diffusion target
-2. Early in training, model predictions are far from targets, producing large MSE gradients
-3. These gradients flow backward through 18 Gemma transformer layers, each containing LoRA operations
-4. LoRA computes `x @ w_a @ w_b` — a chain of two matrix multiplications
-5. In bfloat16, the backward pass through this chain can overflow (bfloat16 max ~3.4e38, but only 7-bit mantissa means limited precision for accumulation)
-6. Once any gradient becomes NaN/Inf, it corrupts the LoRA weight update
-7. The corrupted LoRA weights then produce NaN in the **next forward pass** — which is why the NaN appears to come from SigLIP (the forward pass reads the corrupted model state)
+1. Flow matching loss uses random Gaussian noise (std=1.0) as the diffusion target
+2. Early in training, large MSE gradients flow backward through 18 Gemma transformer layers
+3. LoRA computes `x @ w_a @ w_b` — two chained matmuls whose backward can overflow in bfloat16
+4. Once any gradient becomes NaN/Inf, the parameter update corrupts all LoRA weights
+5. The next forward pass reads corrupted weights and produces NaN everywhere
 
-### Evidence
-
-Three experiments confirmed this:
+**Evidence**:
 
 | Experiment | Result |
 |-----------|--------|
@@ -75,78 +71,96 @@ Three experiments confirmed this:
 | AE LoRA frozen, Gemma LoRA trainable | NaN at step 3 |
 | All LoRA frozen, fixed noise std=0.1 | All 200 steps clean |
 
-With frozen LoRA and reduced noise, no overflow occurs. With trainable LoRA and full noise, the gradient magnitudes exceed bfloat16 capacity within a few steps.
-
-## The Fix
-
-**Compute all LoRA operations in float32**, cast back to bfloat16 for output.
-
-### `lora.py` — Einsum class (attention Q/K/V/O projections)
+**Fix** in `lora.py` — compute all LoRA operations in float32, cast back to bfloat16:
 
 ```python
-# Before (broken):
-lora = jnp.einsum(eqn_a, x, self.w_a.astype(dtype))
-lora = jnp.einsum(eqn_b, lora, self.w_b.astype(dtype))
-result = result + lora * config.scaling_value
-
-# After (fixed):
+# Einsum class (attention Q/K/V/O):
 x_f32 = x.astype(jnp.float32)
 lora = jnp.einsum(eqn_a, x_f32, self.w_a.astype(jnp.float32))
 lora = jnp.einsum(eqn_b, lora, self.w_b.astype(jnp.float32))
 result = result + (lora * config.scaling_value).astype(dtype)
-```
 
-### `lora.py` — FeedForward class (MLP gating + linear)
-
-```python
-# Before (broken):
-return base + jnp.dot(jnp.dot(x, lora_weights[0].astype(x.dtype)),
-                       lora_weights[1].astype(x.dtype))
-
-# After (fixed):
+# FeedForward class (MLP):
 x_f32 = x.astype(jnp.float32)
 lora = jnp.dot(jnp.dot(x_f32, lora_weights[0].astype(jnp.float32)),
                 lora_weights[1].astype(jnp.float32))
 return base + lora.astype(x.dtype)
 ```
 
-### Why this works
+This fixed the text-only path (200 steps clean, grad_norm ~0.15).
 
-- **Forward pass**: LoRA contribution computed in float32 (no overflow), then downcast to bfloat16 for addition to base weights
-- **Backward pass**: JAX autograd computes LoRA gradients in float32 (matching the forward dtype), preventing accumulation overflow through 18 transformer layers
-- **Base weights**: Still computed in bfloat16 (unchanged) — only LoRA path needs float32
+### Root Cause 2: bfloat16 Forward Pass Overflow on Specific Batches
+
+**Fix**: NaN gradient guard in `train.py`.
+
+After fixing LoRA, the NaN returned when audio mixing was enabled. Investigation:
+
+1. **`num_workers=2` data corruption**: Default multi-worker loading with librosa/WhisperFeatureExtractor causes shared memory corruption, producing `max=3.675e+27` in mel spectrograms. **Fixed by setting `num_workers=0`.**
+
+2. **Persistent NaN at step 3**: Even with `num_workers=0` and float32 LoRA, NaN at step 3 persisted with audio. Key experiment: text-only with `num_workers=0` **also NaN'd at step 3** — proving audio was irrelevant. The `num_workers=0` batch ordering puts a problematic batch at step 3 that triggers bfloat16 overflow in the forward pass.
+
+3. **Forward pass confirmed**: `loss=nan` at step 3 while `param_norm=2115.1724` at step 2 — params were clean, so the NaN originated in the forward pass, not from corrupted weights.
+
+4. **All SigLIP-level fixes failed**: Float32 SigLIP, disabled remat, stop_gradient — none helped. The bfloat16 overflow in the forward pass cannot be eliminated without changing the entire model to float32.
+
+**Fix** in `train.py` — NaN gradient guard that skips parameter updates when gradients contain NaN/Inf:
+
+```python
+grad_norm = optax.global_norm(grads)
+grad_finite = jnp.isfinite(grad_norm)
+
+# ... compute updates normally ...
+
+# Skip update if gradients are NaN/Inf — preserve params and optimizer state.
+new_params = jax.tree.map(
+    lambda new, old: jnp.where(grad_finite, new, old), new_params, params
+)
+new_opt_state = jax.tree.map(
+    lambda new, old: jnp.where(grad_finite, new, old), new_opt_state, state.opt_state
+)
+```
+
+The guard also reports `nan_skipped` in the training metrics for monitoring.
 
 ## Validation
 
-200-step test run with the fix applied — **zero NaN**:
+Full Stage 3 training launched with both fixes. First 700 steps:
 
 ```
-Step   0: loss=0.0853, grad_norm=0.1464, param_norm=2115.17
-Step  10: loss=0.0941, grad_norm=0.1694, param_norm=2115.17
-Step  50: loss=0.0878, grad_norm=0.1530, param_norm=2115.17
-Step 100: loss=0.0863, grad_norm=0.1563, param_norm=2115.17
-Step 150: loss=0.0851, grad_norm=0.1470, param_norm=2115.17
-Step 190: loss=0.0822, grad_norm=0.1464, param_norm=2115.17
+Step   0: loss=nan, grad_norm=nan, nan_skipped=1.0 (skipped), param_norm=2115.1724
+Step 100: loss=0.1394, grad_norm=0.6129, nan_skipped=0.0, param_norm=2115.1724
+Step 200: loss=0.0897, grad_norm=0.2723, nan_skipped=0.0, param_norm=2115.1724
+Step 300: loss=0.0779, grad_norm=0.2512, nan_skipped=0.0, param_norm=2115.1729
+Step 400: loss=0.0696, grad_norm=0.2414, nan_skipped=0.0, param_norm=2115.1733
+Step 500: loss=0.0658, grad_norm=0.2618, nan_skipped=0.0, param_norm=2115.1736
+Step 600: loss=0.0627, grad_norm=0.2469, nan_skipped=0.0, param_norm=2115.1748
+Step 700: loss=0.0601, grad_norm=0.2179, nan_skipped=0.0, param_norm=2115.1758
 ```
 
-Loss trending down (0.085 -> 0.082), grad norms stable (~0.14-0.17), param norms constant. The fix is confirmed.
+- Only 1 NaN trigger (step 0) in 700+ steps — guard skipped it, params preserved
+- Loss steadily decreasing: 0.14 → 0.06
+- Grad norms stable: 0.22-0.61
+- param_norm drifting slowly — healthy learning
 
-## Additional Stage 3 Config Changes
+## Config
 
-Alongside the LoRA fix, Stage 3 config was tuned:
+Final Stage 3 settings:
 
-| Parameter | Before | After | Reason |
-|-----------|--------|-------|--------|
-| Gemma LoRA LR | 1.0x (2e-5) | 0.3x (6e-6) | Slower adaptation preserves Stage 2 audio representations |
-| Warmup steps | 1,000 | 5,000 | Gentler ramp prevents early gradient spikes |
-| Log interval | default | 10 | Faster NaN detection in logs |
-
-Per-component LR scaling (applied via gradient scaling in `train.py`):
-- Action expert LoRA (fresh init): 1.0x (2e-5) — learn from scratch
-- Gemma LoRA (Stage 2 pretrained): 0.3x (6e-6) — adapt slowly
-- Audio projector (Stage 2 pretrained): 0.1x (2e-6) — fine-tune gently
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| warmup_steps | 1,000 | Standard; NaN fix is in code, not schedule |
+| peak_lr | 2e-5 | Standard Pi0.5 fine-tuning LR |
+| Gemma LoRA LR | 0.5x (1e-5) | Preserve Stage 2 audio knowledge |
+| Audio projector LR | 0.1x (2e-6) | Well-trained, gentle fine-tune only |
+| AE LoRA LR | 1.0x (2e-5) | Fresh init, must learn from scratch |
+| num_workers | 0 | Prevents librosa shared memory corruption |
+| log_interval | 50 | Good monitoring granularity |
+| batch_size | 32 | Standard |
+| num_train_steps | 30,000 | ~3.5 epochs over 273k frames |
 
 ## Files Modified
 
 - `src/openpi/models/lora.py` — float32 LoRA computation (Einsum + FeedForward)
-- `src/openpi/training/config.py` — Gemma LoRA 0.3x LR, warmup 5000, log_interval 10
+- `scripts/train.py` — NaN gradient guard (skip update on NaN/Inf gradients) + `nan_skipped` metric
+- `src/openpi/training/config.py` — `num_workers=0`, Gemma LoRA 0.5x LR, `log_interval=50`
+- `examples/libero/main.py` — Clear text prompt in audio eval mode (train/eval consistency)
