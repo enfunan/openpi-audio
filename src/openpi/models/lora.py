@@ -54,18 +54,18 @@ class Einsum(nn.Module):
     @nn.compact
     def __call__(self, eqn: str, x):
         dtype = x.dtype  # original dtype, could be half-precision
-        result = jnp.einsum(eqn, x, self.w.astype(dtype))
+        # Compute base AND LoRA in float32 to prevent bfloat16 overflow
+        # in the Gemma MLP/attention forward pass (18 layers of accumulation).
+        x_f32 = x.astype(jnp.float32)
+        result = jnp.einsum(eqn, x_f32, self.w.astype(jnp.float32))
 
         if config := self.lora_config:
             eqn_a, eqn_b = self._make_lora_eqns(eqn)
-            # Compute LoRA in float32 to prevent bfloat16 gradient overflow
-            # during backward pass through transformer layers.
-            x_f32 = x.astype(jnp.float32)
             lora = jnp.einsum(eqn_a, x_f32, self.w_a.astype(jnp.float32))
             lora = jnp.einsum(eqn_b, lora, self.w_b.astype(jnp.float32))
-            result = result + (lora * config.scaling_value).astype(dtype)
+            result = result + lora * config.scaling_value
 
-        return result
+        return result.astype(dtype)
 
     def _make_lora_eqns(self, eqn: str) -> tuple[str, str]:
         if "L" in eqn:
@@ -126,6 +126,7 @@ class FeedForward(nn.Module):
     @nn.compact
     def __call__(self, x):
         dtype = x.dtype  # original dtype, could be half-precision
+        # All _dot calls return float32; intermediate ops (GELU, gate*ff1) stay in float32.
         ff_gate = self._dot(
             x,
             self.w_gating[0],
@@ -141,14 +142,14 @@ class FeedForward(nn.Module):
         activations = gate_value * ff1
 
         outputs = self._dot(activations, self.w_linear, self.w_linear_lora)
-        assert outputs.dtype == dtype
-        return outputs
+        return outputs.astype(dtype)  # cast back to bfloat16 at the end
 
     def _dot(self, x: at.Array, w: at.Array, lora_weights: tuple[at.Array, at.Array] | None) -> at.Array:
-        base = jnp.dot(x, w.astype(x.dtype))
-        if lora_weights is None:
-            return base
-        # Compute LoRA in float32 to prevent bfloat16 gradient overflow.
+        # Compute base + LoRA in float32 to prevent bfloat16 overflow
+        # in the Gemma MLP forward pass (2048->16384->2048 with GELU gating).
         x_f32 = x.astype(jnp.float32)
+        base = jnp.dot(x_f32, w.astype(jnp.float32))
+        if lora_weights is None:
+            return base  # float32 — caller handles final dtype cast
         lora = jnp.dot(jnp.dot(x_f32, lora_weights[0].astype(jnp.float32)), lora_weights[1].astype(jnp.float32))
-        return base + lora.astype(x.dtype)
+        return base + lora  # float32 — caller handles final dtype cast

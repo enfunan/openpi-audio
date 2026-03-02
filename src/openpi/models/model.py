@@ -243,12 +243,23 @@ class BaseModelConfig(abc.ABC):
 
     def load(self, params: at.Params, *, remove_extra_params: bool = True) -> "BaseModel":
         """Create a model with the given parameters."""
+        from flax import traverse_util
+        from flax.nnx.traversals import unflatten_mapping
+
         model = nnx.eval_shape(self.create, jax.random.key(0))
         graphdef, state = nnx.split(model)
         if remove_extra_params:
             params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
-        at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
-        state.replace_by_pure_dict(params)
+        # Manual flat_state merge to handle int/str key mismatches (e.g. whisper encoder layers).
+        flat_state = state.flat_state()
+        for kp, v in traverse_util.flatten_dict(params).items():
+            if kp in flat_state:
+                flat_state[kp] = flat_state[kp].replace(v) if hasattr(flat_state[kp], 'replace') else v
+            else:
+                int_kp = tuple(int(k) if isinstance(k, str) and k.isdigit() else k for k in kp)
+                if int_kp in flat_state:
+                    flat_state[int_kp] = flat_state[int_kp].replace(v) if hasattr(flat_state[int_kp], 'replace') else v
+        state.update(unflatten_mapping(flat_state))
         return nnx.merge(graphdef, state)
 
     def load_pytorch(self, train_config, weight_path: str):

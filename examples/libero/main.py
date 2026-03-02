@@ -51,7 +51,8 @@ class Args:
     # Audio evaluation parameters
     #################################################################################################################
     audio_dir: str = ""  # TTS cache directory (empty = text-only eval)
-    eval_mode: str = "text"  # "text", "audio", or "both"
+    eval_mode: str = "text"  # "text", "audio", "asr", or "both"
+    whisper_model: str = "openai/whisper-large-v2"  # Whisper model for ASR pipeline mode
 
 
 def _load_tts_manifest(audio_dir: str) -> dict[str, list[str]]:
@@ -86,8 +87,19 @@ def eval_libero(args: Args) -> None:
 
     # Load TTS manifest if audio mode is requested
     manifest = None
-    if args.audio_dir and args.eval_mode in ("audio", "both"):
+    if args.audio_dir and args.eval_mode in ("audio", "asr", "both"):
         manifest = _load_tts_manifest(args.audio_dir)
+
+    # Load Whisper model for ASR pipeline mode
+    whisper_pipeline = None
+    if args.eval_mode == "asr":
+        import transformers
+        whisper_pipeline = transformers.pipeline(
+            "automatic-speech-recognition",
+            model=args.whisper_model,
+            device="cpu",
+        )
+        logging.info(f"Loaded Whisper ASR pipeline: {args.whisper_model}")
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -116,6 +128,8 @@ def eval_libero(args: Args) -> None:
     results_by_mode: dict[str, dict[str, Any]] = {}
     for mode in modes:
         use_audio = mode == "audio" and manifest is not None
+        use_zero_audio = mode == "zero_audio"
+        use_asr = mode == "asr" and manifest is not None and whisper_pipeline is not None
         logging.info(f"\n{'='*60}")
         logging.info(f"Running evaluation in {mode.upper()} mode")
         logging.info(f"{'='*60}")
@@ -146,8 +160,18 @@ def eval_libero(args: Args) -> None:
 
                 # Pre-load audio for this episode (same waveform reused across replan steps)
                 audio_waveform = None
+                asr_transcription = None
                 if use_audio:
                     audio_waveform = _load_random_audio(manifest, task_description)
+                if use_zero_audio:
+                    # Send 3 seconds of silence — tests if model ignores audio entirely
+                    audio_waveform = np.zeros(16000 * 3, dtype=np.float32)
+                if use_asr:
+                    audio_waveform = _load_random_audio(manifest, task_description)
+                    if audio_waveform is not None:
+                        result = whisper_pipeline({"raw": audio_waveform, "sampling_rate": 16000})
+                        asr_transcription = result["text"].strip().lower()
+                        logging.info(f"ASR transcription: '{asr_transcription}' (ground truth: '{task_description}')")
 
                 # Setup
                 t = 0
@@ -198,6 +222,15 @@ def eval_libero(args: Args) -> None:
                             if use_audio and audio_waveform is not None:
                                 element["audio"] = audio_waveform
                                 element["prompt"] = ""
+
+                            # Zero audio mode: silent waveform, no text prompt.
+                            if use_zero_audio:
+                                element["audio"] = audio_waveform
+                                element["prompt"] = ""
+
+                            # ASR pipeline: use Whisper transcription as text prompt.
+                            if use_asr and asr_transcription is not None:
+                                element["prompt"] = asr_transcription
 
                             # Query model to get action
                             action_chunk = client.infer(element)["actions"]

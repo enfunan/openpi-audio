@@ -997,7 +997,8 @@ _CONFIGS = [
             "./checkpoints/pi05_audio_mixed_asr/mixed_asr/14999/params"
         ),
         # Freeze SigLIP + LLM base weights + Whisper.
-        # Trainable: Gemma LoRA + action expert LoRA + action head + audio projector.
+        # Gemma LoRA kept "trainable" (float32, gets gradients) but LR=0 via lr_scale_overrides.
+        # Cannot use freeze_filter for Gemma LoRA: bfloat16 cast causes persistent NaN in forward pass.
         freeze_filter=nnx.Any(
             nnx_utils.PathRegex(".*PaliGemma/img.*"),
             nnx.All(
@@ -1006,11 +1007,13 @@ _CONFIGS = [
             ),
             nnx_utils.PathRegex(".*whisper_encoder.*"),
         ),
-        # LR scaling: audio projector 0.1x, Gemma LoRA 0.5x (preserve Stage 2 audio knowledge).
-        # AE LoRA at full LR (fresh init). Regex matches Gemma einsums (no _1 suffix) + mlp (not mlp_1).
+        # LR scaling: fully freeze audio pathway to preserve Stage 2 ASR conditioning.
+        # Float32 base matmuls in lora.py eliminate the bfloat16 NaN issue, so 0.0 is safe.
+        # Gemma LoRA: unsuffixed attn einsums + mlp params. AE LoRA has _1 suffix, unaffected.
         lr_scale_overrides={
-            nnx_utils.PathRegex(".*audio_projector.*"): 0.1,
-            nnx_utils.PathRegex(r".*/attn/(q_einsum|kv_einsum|attn_vec_einsum)/lora_[ab]|.*/mlp/.*lora.*"): 0.5,
+            nnx_utils.PathRegex(".*audio_projector.*"): 0.0,
+            nnx_utils.PathRegex(r".*llm.*/attn/(q_einsum|kv_einsum|qkv_einsum|attn_vec_einsum)/lora_[ab]"): 0.0,
+            nnx_utils.PathRegex(r".*llm.*/mlp/(gating_einsum|linear)_lora_[ab]"): 0.0,
         },
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
