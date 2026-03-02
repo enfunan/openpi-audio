@@ -179,6 +179,7 @@ class Pi0(_model.BaseModel):
 
         # Training stage for multi-stage audio pipeline (set by Pi0Config.create()).
         self._training_stage: str | None = None
+        self._asr_aux_weight: float = 0.0
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -386,19 +387,10 @@ class Pi0(_model.BaseModel):
         return jnp.mean(jnp.square(audio_mean - text_mean))
 
     @override
-    def compute_loss(
+    def _compute_flow_matching_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
-        # Dispatch to alignment loss for ASR alignment stage.
-        if self._training_stage == "asr_alignment":
-            loss = self.compute_alignment_loss(rng, observation, train=train)
-            batch_shape = actions.shape[:-2]
-            return jnp.broadcast_to(loss, (*batch_shape, self.action_horizon))
-        if self._training_stage == "embedding_alignment":
-            loss = self.compute_embedding_alignment_loss(rng, observation, train=train)
-            batch_shape = actions.shape[:-2]
-            return jnp.broadcast_to(loss, (*batch_shape, self.action_horizon))
-
+        """Standard flow matching loss for robot action prediction."""
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -422,6 +414,40 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+
+    @override
+    def compute_loss(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> at.Float[at.Array, "*b ah"]:
+        # Dispatch to alignment loss for ASR alignment stage.
+        if self._training_stage == "asr_alignment":
+            loss = self.compute_alignment_loss(rng, observation, train=train)
+            batch_shape = actions.shape[:-2]
+            return jnp.broadcast_to(loss, (*batch_shape, self.action_horizon))
+        if self._training_stage == "embedding_alignment":
+            loss = self.compute_embedding_alignment_loss(rng, observation, train=train)
+            batch_shape = actions.shape[:-2]
+            return jnp.broadcast_to(loss, (*batch_shape, self.action_horizon))
+
+        # Stage 3v3: dual loss with auxiliary ASR regularization.
+        # Both losses are computed for all samples; jnp.where selects per sample.
+        # jnp.where naturally zeros gradients for the unselected branch.
+        if self._training_stage == "robot_task_asr_aux" and observation.is_asr is not None:
+            fm_rng, asr_rng = jax.random.split(rng)
+            batch_shape = actions.shape[:-2]
+            is_asr = observation.is_asr  # (B,)
+
+            # Flow matching loss: (B, ah). Garbage for ASR samples but masked out.
+            fm_loss = self._compute_flow_matching_loss(fm_rng, observation, actions, train=train)
+
+            # ASR CE loss: scalar, broadcast to (B, ah). Garbage for robot samples but masked out.
+            asr_loss = self.compute_alignment_loss(asr_rng, observation, train=train)
+            asr_loss_broadcast = jnp.broadcast_to(asr_loss, (*batch_shape, self.action_horizon))
+
+            # Per-sample selection: ASR samples get weighted ASR loss, robot samples get FM loss.
+            return jnp.where(is_asr[..., None], self._asr_aux_weight * asr_loss_broadcast, fm_loss)
+
+        return self._compute_flow_matching_loss(rng, observation, actions, train=train)
 
     @override
     def sample_actions(

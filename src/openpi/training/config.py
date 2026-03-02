@@ -401,6 +401,43 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotLiberoASRDataConfig(LeRobotLiberoDataConfig):
+    """LIBERO data with auxiliary ASR sample injection from LibriSpeech.
+
+    Extends LeRobotLiberoDataConfig by injecting an ASRSampleInjector transform
+    into the data pipeline. With probability `asr_ratio`, a training sample is
+    replaced with a LibriSpeech audio+transcription pair (dummy images/actions).
+    The `is_asr` flag propagates to the Observation, where compute_loss uses
+    jnp.where to select between ASR CE loss and flow matching loss per sample.
+    """
+
+    # Path to LibriSpeech split directory (e.g., /data/librispeech/train-clean-360).
+    librispeech_dir: str = ""
+    # Fraction of samples replaced with LibriSpeech ASR samples.
+    asr_ratio: float = 0.2
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        config = super().create(assets_dirs, model_config)
+
+        # Inject ASRSampleInjector after LiberoInputs in data_transforms.
+        if self.librispeech_dir:
+            asr_injector = _transforms.ASRSampleInjector(
+                librispeech_dir=self.librispeech_dir,
+                asr_ratio=self.asr_ratio,
+            )
+            config = dataclasses.replace(
+                config,
+                data_transforms=_transforms.Group(
+                    inputs=[*config.data_transforms.inputs, asr_injector],
+                    outputs=config.data_transforms.outputs,
+                ),
+            )
+
+        return config
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -1030,6 +1067,66 @@ _CONFIGS = [
         log_interval=50,
         wandb_enabled=True,
         exp_name="stage3_libero",
+    ),
+    # Stage 3v3: LIBERO robot training with auxiliary ASR loss.
+    # Like v2 but Gemma LoRA is trainable (0.3x LR) with 20% LibriSpeech ASR
+    # samples as a regularizer to prevent catastrophic forgetting of audio.
+    # Audio projector stays frozen (0.0). ASR CE loss weighted by 0.01.
+    # Set --data.librispeech-dir and --data.tts-cache-dir at runtime.
+    TrainConfig(
+        name="pi05_audio_stage3v3_libero",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            audio_enabled=True,
+            training_stage="robot_task_asr_aux",
+            asr_aux_weight=0.01,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoASRDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            # ASR auxiliary settings (override via CLI).
+            librispeech_dir="",
+            asr_ratio=0.2,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "./checkpoints/pi05_audio_mixed_asr/mixed_asr/14999/params"
+        ),
+        freeze_filter=nnx.Any(
+            nnx_utils.PathRegex(".*PaliGemma/img.*"),
+            nnx.All(
+                nnx_utils.PathRegex(".*llm.*"),
+                nnx.Not(nnx_utils.PathRegex(".*lora.*")),
+            ),
+            nnx_utils.PathRegex(".*whisper_encoder.*"),
+        ),
+        # Gemma LoRA at 0.3x LR (6e-6 effective) — trainable but slow.
+        # Audio projector frozen (0.0) — simple linear layer, no need to retrain.
+        # ASR auxiliary loss on 20% of batch maintains audio conditioning.
+        lr_scale_overrides={
+            nnx_utils.PathRegex(".*audio_projector.*"): 0.0,
+            nnx_utils.PathRegex(r".*llm.*/attn/(q_einsum|kv_einsum|qkv_einsum|attn_vec_einsum)/lora_[ab]"): 0.3,
+            nnx_utils.PathRegex(r".*llm.*/mlp/(gating_einsum|linear)_lora_[ab]"): 0.3,
+        },
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2e-5,
+            decay_steps=30_000,
+            decay_lr=2e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=0,
+        save_interval=1_000,
+        log_interval=50,
+        wandb_enabled=True,
+        exp_name="stage3v3_libero",
     ),
     TrainConfig(
         name="pi0_aloha_towel",

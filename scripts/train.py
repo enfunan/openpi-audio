@@ -159,14 +159,14 @@ def train_step(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        return jnp.mean(chunked_loss), chunked_loss
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, chunked_loss), grads = nnx.value_and_grad(loss_fn, has_aux=True, argnums=diff_state)(model, train_rng, observation, actions)
 
     # Apply per-parameter LR scaling by scaling gradients before the optimizer.
     # E.g., scaling audio_projector gradients by 0.1 gives it 10x lower effective LR.
@@ -218,6 +218,17 @@ def train_step(
         "param_norm": optax.global_norm(kernel_params),
         "nan_skipped": jnp.where(grad_finite, 0.0, 1.0),
     }
+
+    # Log per-mode metrics when auxiliary ASR loss is active.
+    if observation.is_asr is not None:
+        per_sample = jnp.mean(chunked_loss, axis=-1)  # [batch]
+        is_asr = observation.is_asr
+        n_asr = jnp.sum(is_asr.astype(jnp.float32))
+        n_robot = jnp.sum((~is_asr).astype(jnp.float32))
+        info["asr_frac"] = n_asr / (n_asr + n_robot + 1e-8)
+        info["fm_loss"] = jnp.where(n_robot > 0, jnp.sum(per_sample * (~is_asr)) / n_robot, 0.0)
+        info["asr_loss_weighted"] = jnp.where(n_asr > 0, jnp.sum(per_sample * is_asr) / n_asr, 0.0)
+
     return new_state, info
 
 

@@ -106,6 +106,10 @@ class Observation(Generic[ArrayT]):
     # Audio mask, True if audio is valid.
     audio_mask: at.Bool[ArrayT, "*b"] | None = None
 
+    # Per-sample flag: True if this sample is an ASR auxiliary sample (LibriSpeech).
+    # Used by compute_loss to select between ASR CE loss and flow matching loss.
+    is_asr: at.Bool[ArrayT, "*b"] | None = None
+
     # pi0-fast model specific fields.
 
     # Token auto-regressive mask (for FAST autoregressive model).
@@ -133,6 +137,7 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             audio=data.get("audio"),
             audio_mask=data.get("audio_mask"),
+            is_asr=data.get("is_asr"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
         )

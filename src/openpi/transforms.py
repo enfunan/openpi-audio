@@ -456,6 +456,67 @@ class AudioTextMixingTransform(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class ASRSampleInjector(DataTransformFn):
+    """Replaces a fraction of training samples with LibriSpeech ASR samples.
+
+    Runs after LiberoInputs in data_transforms, so data is already in
+    standardized format (state, image, image_mask, actions, prompt).
+    When triggered, replaces the sample's content with LibriSpeech audio +
+    transcription, zeros out robot-specific fields, and sets is_asr=True.
+    The ASR loss branch in compute_loss uses audio + text; the flow matching
+    branch produces garbage but is masked out by jnp.where(is_asr, ...).
+    """
+
+    librispeech_dir: str = ""
+    asr_ratio: float = 0.2
+
+    def __post_init__(self):
+        object.__setattr__(self, "_dataset", None)
+        object.__setattr__(self, "_rng", None)
+
+    def _get_dataset(self):
+        if self._dataset is None:
+            from openpi.training.librispeech_dataset import LibriSpeechDataset
+
+            ds = LibriSpeechDataset(data_dir=self.librispeech_dir)
+            object.__setattr__(self, "_dataset", ds)
+        return self._dataset
+
+    def _get_rng(self):
+        if self._rng is None:
+            import random
+
+            object.__setattr__(self, "_rng", random.Random())
+        return self._rng
+
+    def __call__(self, data: DataDict) -> DataDict:
+        data["is_asr"] = np.bool_(False)
+
+        if not self.librispeech_dir:
+            return data
+
+        rng = self._get_rng()
+        if rng.random() < self.asr_ratio:
+            dataset = self._get_dataset()
+            sample = dataset[rng.randint(0, len(dataset) - 1)]
+
+            # Zero out robot-specific data, keeping shapes for batch collation.
+            data["state"] = np.zeros_like(data["state"])
+            data["actions"] = np.zeros_like(data["actions"])
+            for k in data["image"]:
+                data["image"][k] = np.zeros_like(data["image"][k])
+            for k in data["image_mask"]:
+                data["image_mask"][k] = np.bool_(False)
+
+            # Inject LibriSpeech audio + transcription.
+            data["prompt"] = sample["prompt"]
+            data["audio_path"] = sample["audio_path"]
+            data["is_asr"] = np.bool_(True)
+
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class PadStatesAndActions(DataTransformFn):
     """Zero-pads states and actions to the model action dimension."""
 

@@ -39,8 +39,13 @@ class Pi0Config(_model.BaseModelConfig):
 
     # Training stage for multi-stage audio pipeline.
     # None = standard training, "asr_alignment" = Stage 1 embedding regression,
-    # "robot_task" = Stage 3 robot task training with audio/text mixing.
+    # "robot_task" = Stage 3 robot task training with audio/text mixing,
+    # "robot_task_asr_aux" = Stage 3 with auxiliary ASR loss on 20% of batch.
     training_stage: str | None = None
+
+    # Weight for auxiliary ASR CE loss (only used when training_stage="robot_task_asr_aux").
+    # ASR CE loss ~3.4, flow matching MSE ~0.04. Weight 0.01 normalizes to ~0.034.
+    asr_aux_weight: float = 0.0
 
     def __post_init__(self):
         if self.max_token_len is None:
@@ -61,6 +66,7 @@ class Pi0Config(_model.BaseModelConfig):
 
         model = Pi0(self, rngs=nnx.Rngs(rng))
         model._training_stage = self.training_stage
+        model._asr_aux_weight = self.asr_aux_weight
         return model
 
     @override
