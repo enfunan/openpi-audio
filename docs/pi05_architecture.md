@@ -125,7 +125,8 @@ time_mlp_out:    Linear(1024 → 1024)
 | Param | Value |
 |---|---|
 | Input resolution | 224 × 224 |
-| Patches | 14×14 = 196... projected to 256 tokens |
+| Patch size | 14 × 14 pixels |
+| Patch grid | 16 × 16 = 256 patches (224 / 14 = 16 per side) |
 | Output dim | 2048 (after `multi_modal_projector`) |
 
 ### Sequence Layout (π0.5 default — LIBERO)
@@ -628,11 +629,18 @@ that match the text teacher.
 
 ### Stage 2: End-to-End Action Fine-tuning (`training_stage="kv_distill_stage2"`)
 
+> **STATUS: NOT YET IMPLEMENTED.** The config exists but `train_kv_distill.py`
+> raises `ValueError` for this stage. Design decisions still open:
+> - Whether to freeze Stage 1 PaliGemma LoRA (preserve accent robustness)
+>   or continue training it
+> - Whether Action Expert LoRA targets all projections or Q/K/V only
+
 **Goal**: Fine-tune the full pipeline including Action Expert LoRA.
 
-**Additional trainable parameters**:
-- Action Expert LoRA (all projections)
-- All PaliGemma projections (Q, K, V, O, gate, up, down)
+**Planned trainable parameters**:
+- Action Expert LoRA (new, all projections)
+- PaliGemma LoRA (TBD: continue training or freeze from Stage 1)
+- Perceiver Resampler (continued)
 
 **Loss**: `flow_matching_loss + β * kv_alignment_loss`
 
