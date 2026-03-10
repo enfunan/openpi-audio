@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 
 import torch
 from torch import Tensor
@@ -8,6 +9,8 @@ import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
+from openpi.models_pytorch.lora_pytorch import GRAD_MODE_BYPASS
+from openpi.models_pytorch.perceiver_resampler import PerceiverResampler
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
 
@@ -108,8 +111,33 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        # Audio components (KV cache distillation)
+        self.audio_enabled = getattr(config, "audio_enabled", False)
+        self.training_stage = getattr(config, "training_stage", "default")
+
+        if self.audio_enabled:
+            paligemma_width = paligemma_config.width  # 2048
+            self.audio_num_tokens = getattr(config, "audio_num_tokens", 32)
+
+            # Whisper encoder (frozen)
+            from transformers import WhisperModel
+            whisper_variant = getattr(config, "whisper_variant", "openai/whisper-large-v3")
+            self.whisper_encoder = WhisperModel.from_pretrained(whisper_variant).encoder
+            self.whisper_encoder.requires_grad_(False)
+
+            # Perceiver Resampler: (B, 1500, 1280) → (B, num_queries, paligemma_width)
+            self.perceiver_resampler = PerceiverResampler(
+                num_queries=self.audio_num_tokens,
+                dim=paligemma_width,
+                num_heads=8,
+                num_layers=getattr(config, "perceiver_num_layers", 2),
+                ffn_dim=getattr(config, "perceiver_ffn_dim", 8192),
+                whisper_dim=1280,  # whisper-large-v3
+            )
+
         torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        if os.environ.get("OPENPI_NO_COMPILE", "") != "1":
+            self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -160,14 +188,7 @@ class PI0Pytorch(nn.Module):
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
-        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
-        return (
-            list(observation.images.values()),
-            list(observation.image_masks.values()),
-            observation.tokenized_prompt,
-            observation.tokenized_prompt_mask,
-            observation.state,
-        )
+        return _preprocessing.preprocess_observation_pytorch(observation, train=train)
 
     def sample_noise(self, shape, device):
         return torch.normal(
@@ -233,6 +254,128 @@ class PI0Pytorch(nn.Module):
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
         return embs, pad_masks, att_masks
+
+    def embed_prefix_audio(
+        self, images, img_masks, audio_whisper_hidden, audio_mask, text_slot_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build prefix with audio tokens replacing the text slot.
+
+        Prefix shape: [images: 768] [audio:N + pad:(text_slot_len-N)] = 968 tokens.
+        Position IDs will match the teacher when caller passes teacher's position_ids.
+
+        Returns:
+            embs:                (B, 968, D)
+            pad_masks:           (B, 968)
+            att_masks:           (B, 968)
+            audio_position_mask: (B, 968) bool — True at audio token positions
+        """
+        if not self.audio_enabled:
+            raise RuntimeError("embed_prefix_audio called but audio_enabled=False")
+
+        # Run Whisper if needed
+        if audio_whisper_hidden is None:
+            raise ValueError("KV distill mode requires precomputed audio_whisper_hidden")
+
+        embs = []
+        pad_masks = []
+        att_masks = []
+        audio_pos_parts = []
+
+        # === Images (identical to teacher) ===
+        for img, img_mask in zip(images, img_masks, strict=True):
+            def image_embed_func(img):
+                return self.paligemma_with_expert.embed_image(img)
+
+            img_emb = self._apply_checkpoint(image_embed_func, img)
+            bsize, num_img_embs = img_emb.shape[:2]
+            device = img.device
+
+            embs.append(img_emb)
+            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+            att_masks += [0] * num_img_embs
+            audio_pos_parts.append(
+                torch.zeros(bsize, num_img_embs, dtype=torch.bool, device=device)
+            )
+
+        # === Audio tokens replacing text slot ===
+        audio_tokens = self.perceiver_resampler(audio_whisper_hidden)  # (B, 32, D)
+
+        # Zero out where audio_mask is False (text-only samples in mixed batches)
+        if audio_mask is not None:
+            audio_tokens = audio_tokens * audio_mask[:, None, None].float()
+
+        num_audio = audio_tokens.shape[1]
+        pad_len = text_slot_len - num_audio
+
+        # Zero-padding to fill remaining text slot positions
+        padding = torch.zeros(
+            bsize, pad_len, audio_tokens.shape[-1],
+            dtype=audio_tokens.dtype, device=audio_tokens.device,
+        )
+        text_slot_embs = torch.cat([audio_tokens, padding], dim=1)  # (B, text_slot_len, D)
+        embs.append(text_slot_embs)
+
+        # Pad masks: True for audio, False for padding
+        audio_pad = torch.ones(bsize, num_audio, dtype=torch.bool, device=device)
+        if audio_mask is not None:
+            audio_pad = audio_pad & audio_mask[:, None].expand(bsize, num_audio)
+        zero_pad = torch.zeros(bsize, pad_len, dtype=torch.bool, device=device)
+        pad_masks.append(torch.cat([audio_pad, zero_pad], dim=1))
+
+        att_masks += [0] * text_slot_len
+
+        # Audio position mask
+        audio_pos = torch.ones(bsize, num_audio, dtype=torch.bool, device=device)
+        pad_pos = torch.zeros(bsize, pad_len, dtype=torch.bool, device=device)
+        audio_pos_parts.append(torch.cat([audio_pos, pad_pos], dim=1))
+
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
+        att_masks = att_masks[None, :].expand(bsize, -1)
+        audio_position_mask = torch.cat(audio_pos_parts, dim=1)
+
+        return embs, pad_masks, att_masks, audio_position_mask
+
+    def forward_prefix_get_kv(
+        self, prefix_embs, prefix_pad_masks, prefix_att_masks,
+        position_ids=None, audio_position_mask=None, gradient_mode=None,
+    ):
+        """Run PaliGemma prefix-only forward and return KV cache (DynamicCache).
+
+        Temporarily disables gradient_checkpointing (incompatible with use_cache).
+        """
+        dtype = self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+        prefix_embs = prefix_embs.to(dtype=dtype)
+
+        att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        if position_ids is None:
+            position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        # Temporarily disable gradient checkpointing (use_cache requires it off)
+        lm = self.paligemma_with_expert.paligemma.language_model
+        gc_was_on = getattr(lm, "gradient_checkpointing", False)
+        if gc_was_on:
+            lm.gradient_checkpointing = False
+
+        lm.config._attn_implementation = "eager"  # noqa: SLF001
+
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=att_2d_masks_4d,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+            adarms_cond=[None, None],
+            audio_mask=audio_position_mask,
+            gradient_mode=gradient_mode,
+        )
+
+        if gc_was_on:
+            lm.gradient_checkpointing = True
+
+        return past_key_values
 
     def embed_suffix(self, state, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -313,9 +456,12 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
+    def forward(self, observation, actions, noise=None, time=None,
+                training_stage=None, gradient_mode=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        obs = self._preprocess_observation(observation, train=True)
+        images = list(obs.images.values())
+        img_masks = list(obs.image_masks.values())
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -327,8 +473,13 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        # Determine gradient mode for LoRA
+        gm = gradient_mode
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, obs.tokenized_prompt, obs.tokenized_prompt_mask,
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(obs.state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -354,6 +505,7 @@ class PI0Pytorch(nn.Module):
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
+                gradient_mode=gm,
             )
             return suffix_out
 
@@ -373,20 +525,50 @@ class PI0Pytorch(nn.Module):
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+    def sample_actions(self, device, observation, noise=None, num_steps=10,
+                       audio_mode=False) -> Tensor:
+        """Do a full inference forward and compute the action.
+
+        Args:
+            audio_mode: If True, use audio input via Perceiver Resampler with LoRA active.
+                        If False, use text input with LoRA bypassed (original behavior).
+        """
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        obs = self._preprocess_observation(observation, train=False)
+        images = list(obs.images.values())
+        img_masks = list(obs.image_masks.values())
+        state = obs.state
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        if audio_mode and self.audio_enabled:
+            # Audio mode: Perceiver Resampler fills text slot, LoRA active
+            audio_wh = getattr(obs, "audio_whisper_hidden", None)
+            if audio_wh is None and getattr(obs, "audio", None) is not None:
+                audio_wh = self.whisper_encoder(obs.audio).last_hidden_state
+            text_slot_len = obs.tokenized_prompt.shape[1]
+            prefix_embs, prefix_pad_masks, prefix_att_masks, audio_pos_mask = (
+                self.embed_prefix_audio(
+                    images, img_masks, audio_wh,
+                    getattr(obs, "audio_mask", None), text_slot_len,
+                )
+            )
+            lora_audio_mask = audio_pos_mask
+            lora_gm = None  # LoRA active
+        else:
+            # Text mode: standard path, LoRA bypassed
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                images, img_masks, obs.tokenized_prompt, obs.tokenized_prompt_mask,
+            )
+            lora_audio_mask = None
+            lora_gm = GRAD_MODE_BYPASS if self.audio_enabled else None
+
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        # Compute image and language key value cache
+        # Compute prefix KV cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
@@ -396,6 +578,8 @@ class PI0Pytorch(nn.Module):
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
+            audio_mask=lora_audio_mask,
+            gradient_mode=lora_gm,
         )
 
         dt = -1.0 / num_steps
@@ -425,6 +609,7 @@ class PI0Pytorch(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        gradient_mode=None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
@@ -453,6 +638,7 @@ class PI0Pytorch(nn.Module):
             inputs_embeds=[None, suffix_embs],
             use_cache=False,
             adarms_cond=[None, adarms_cond],
+            gradient_mode=gradient_mode,
         )
 
         suffix_out = outputs_embeds[1]

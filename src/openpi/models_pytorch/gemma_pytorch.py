@@ -76,6 +76,8 @@ class PaliGemmaWithExpertModel(nn.Module):
             "input_layernorm",
             "post_attention_layernorm",
             "model.norm",
+            # LoRA params must stay float32 for numerical stability
+            "task_A", "task_B", "audio_A", "audio_B",
         ]
 
         for name, param in self.named_parameters():
@@ -96,10 +98,20 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        audio_mask: torch.Tensor | None = None,
+        gradient_mode: int | None = None,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
+            # Prefix-only forward (KV cache computation or alignment).
+            # Thread LoRA routing kwargs if audio_mask is present.
+            extra_kwargs = {}
+            if audio_mask is not None:
+                extra_kwargs["audio_mask"] = audio_mask
+            if gradient_mode is not None:
+                extra_kwargs["gradient_mode"] = gradient_mode
+
             prefix_output = self.paligemma.language_model.forward(
                 inputs_embeds=inputs_embeds[0],
                 attention_mask=attention_mask,
@@ -107,11 +119,17 @@ class PaliGemmaWithExpertModel(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
+                **extra_kwargs,
             )
             prefix_past_key_values = prefix_output.past_key_values
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
+            # Suffix-only (action expert) forward. Pass gradient_mode for expert LoRA.
+            extra_kwargs = {}
+            if gradient_mode is not None:
+                extra_kwargs["gradient_mode"] = gradient_mode
+
             suffix_output = self.gemma_expert.model.forward(
                 inputs_embeds=inputs_embeds[1],
                 attention_mask=attention_mask,
@@ -119,6 +137,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
+                **extra_kwargs,
             )
             suffix_output = suffix_output.last_hidden_state
             prefix_output = None
@@ -167,11 +186,14 @@ class PaliGemmaWithExpertModel(nn.Module):
                     hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
                     gates.append(gate)
 
+                    # LoRA kwargs: PaliGemma (i==0) gets audio routing; action expert does not.
+                    lora_kw = dict(audio_mask=audio_mask, gradient_mode=gradient_mode) if i == 0 and audio_mask is not None else {}
+
                     input_shape = hidden_states.shape[:-1]
                     hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
-                    query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-                    key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-                    value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                    query_state = layer.self_attn.q_proj(hidden_states, **lora_kw).view(hidden_shape).transpose(1, 2)
+                    key_state = layer.self_attn.k_proj(hidden_states, **lora_kw).view(hidden_shape).transpose(1, 2)
+                    value_state = layer.self_attn.v_proj(hidden_states, **lora_kw).view(hidden_shape).transpose(1, 2)
 
                     query_states.append(query_state)
                     key_states.append(key_state)
@@ -217,9 +239,11 @@ class PaliGemmaWithExpertModel(nn.Module):
                     layer = models[i].layers[layer_idx]
                     end_pos = start_pos + hidden_states.shape[1]
 
+                    lora_kw = dict(audio_mask=audio_mask, gradient_mode=gradient_mode) if i == 0 and audio_mask is not None else {}
+
                     if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
                         att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
-                    out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
+                    out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos], **lora_kw)
 
                     # first residual
                     out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
@@ -229,7 +253,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                     if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
                         out_emb = out_emb.to(dtype=torch.bfloat16)
 
-                    out_emb = layer.mlp(out_emb)
+                    out_emb = layer.mlp(out_emb, **lora_kw)
                     # second residual
                     out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
                     outputs_embeds.append(out_emb)

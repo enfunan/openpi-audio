@@ -32,6 +32,21 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Audio / KV cache distillation options.
+    audio_enabled: bool = False
+    whisper_variant: str = "openai/whisper-large-v3"
+    audio_num_tokens: int = 32
+    perceiver_num_layers: int = 2
+    perceiver_ffn_dim: int = 8192
+    # KV distillation loss weight for semantic (text/audio region) component.
+    kv_distill_alpha: float = 1.0
+    # KV alignment regularization weight in Stage 2.
+    kv_distill_beta: float = 0.1
+    # Training stage: "default" (flow matching), "kv_distill" (Stage 1), "kv_distill_stage2".
+    training_stage: str = "default"
+    # Which PaliGemma projections get LoRA: "qkv" or "all".
+    lora_targets: str = "qkv"
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
