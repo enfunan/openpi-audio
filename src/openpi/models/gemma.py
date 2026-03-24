@@ -50,9 +50,11 @@ class Config:
     num_kv_heads: int
     head_dim: int
     lora_configs: dict[str, lora.LoRAConfig] = dataclasses.field(default_factory=dict)
+    # Audio LoRA configs for split LoRA mode. Keys mirror lora_configs ("attn", "ffn").
+    audio_lora_configs: dict[str, lora.LoRAConfig] = dataclasses.field(default_factory=dict)
 
 
-Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora"]
+Variant = Literal["dummy", "dummy_split_lora", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora", "gemma_2b_split_lora"]
 
 
 def get_config(variant: Variant) -> Config:
@@ -65,6 +67,17 @@ def get_config(variant: Variant) -> Config:
             num_heads=8,
             num_kv_heads=1,
             head_dim=16,
+        )
+    if variant == "dummy_split_lora":
+        return Config(
+            width=64,
+            depth=4,
+            mlp_dim=128,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=16,
+            lora_configs={"attn": lora.LoRAConfig(rank=4, alpha=4.0), "ffn": lora.LoRAConfig(rank=4, alpha=4.0)},
+            audio_lora_configs={"attn": lora.LoRAConfig(rank=4, alpha=4.0), "ffn": lora.LoRAConfig(rank=4, alpha=4.0)},
         )
     if variant == "gemma_300m":
         # 311M params
@@ -94,6 +107,17 @@ def get_config(variant: Variant) -> Config:
             num_kv_heads=1,
             head_dim=256,
             lora_configs={"attn": lora.LoRAConfig(rank=16, alpha=16.0), "ffn": lora.LoRAConfig(rank=16, alpha=16.0)},
+        )
+    if variant == "gemma_2b_split_lora":
+        return Config(
+            width=2048,
+            depth=18,
+            mlp_dim=16_384,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
+            lora_configs={"attn": lora.LoRAConfig(rank=16, alpha=16.0), "ffn": lora.LoRAConfig(rank=16, alpha=16.0)},
+            audio_lora_configs={"attn": lora.LoRAConfig(rank=16, alpha=16.0), "ffn": lora.LoRAConfig(rank=16, alpha=16.0)},
         )
     if variant == "gemma_300m_lora":
         # 311M params
@@ -156,12 +180,12 @@ class Embedder(nn.Module):
 
 @at.typecheck
 class Attention(nn.Module):
-    """Attention module."""
+    """Attention module with optional split LoRA support."""
 
     configs: Sequence[Config]
 
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache):
+    def __call__(self, xs, positions, attn_mask, kv_cache, audio_mask=None, gradient_mode=None):
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
@@ -173,29 +197,39 @@ class Attention(nn.Module):
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is None:
                 continue
+            # Determine audio_mask slice for this expert's tokens.
+            # audio_mask only applies to the first expert (PaliGemma prefix).
+            expert_audio_mask = audio_mask if (i == 0 and audio_mask is not None) else None
+            # Always pass audio_lora_config from config so params are created during init.
+            # The Einsum.__call__ handles None audio_mask by falling back to single LoRA.
+            audio_lora_attn = config.audio_lora_configs.get("attn")
+
             if config.num_kv_heads == config.num_heads:
                 qkv_einsum = lora.Einsum(
                     shape=(3, config.num_heads, config.width, config.head_dim),
                     name=_name("qkv_einsum", i),
                     init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0, 1)),
                     lora_config=config.lora_configs.get("attn"),
+                    audio_lora_config=audio_lora_attn,
                 )
-                qkvs.append(qkv_einsum("BSD,3KDH->3BSKH", x))
+                qkvs.append(qkv_einsum("BSD,3KDH->3BSKH", x, audio_mask=expert_audio_mask, gradient_mode=gradient_mode))
             else:
                 q_einsum = lora.Einsum(
                     shape=(config.num_heads, config.width, config.head_dim),
                     name=_name("q_einsum", i),
                     init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
                     lora_config=config.lora_configs.get("attn"),
+                    audio_lora_config=audio_lora_attn,
                 )
-                q = q_einsum("BTD,NDH->BTNH", x)
+                q = q_einsum("BTD,NDH->BTNH", x, audio_mask=expert_audio_mask, gradient_mode=gradient_mode)
                 kv_einsum = lora.Einsum(
                     shape=(2, config.num_kv_heads, config.width, config.head_dim),
                     name=_name("kv_einsum", i),
                     init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0, 1)),
                     lora_config=config.lora_configs.get("attn"),
+                    audio_lora_config=audio_lora_attn,
                 )
-                k, v = kv_einsum("BSD,2KDH->2BSKH", x)
+                k, v = kv_einsum("BSD,2KDH->2BSKH", x, audio_mask=expert_audio_mask, gradient_mode=gradient_mode)
                 qkvs.append((q, k, v))
 
         q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkvs, strict=True))
@@ -235,49 +269,21 @@ class Attention(nn.Module):
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is not None:
                 end = start + x.shape[1]
+                expert_audio_mask = audio_mask if (i == 0 and audio_mask is not None) else None
+                audio_lora_attn = config.audio_lora_configs.get("attn")
                 out_einsum = lora.Einsum(
                     shape=(config.num_heads, config.head_dim, config.width),
                     name=_name("attn_vec_einsum", i),
                     init_fn=nn.initializers.lecun_normal(in_axis=(-3, -2), out_axis=-1),
                     lora_config=config.lora_configs.get("attn"),
+                    audio_lora_config=audio_lora_attn,
                 )
-                out.append(out_einsum("BTNH,NHD->BTD", encoded[:, start:end]))
+                out.append(out_einsum("BTNH,NHD->BTD", encoded[:, start:end], audio_mask=expert_audio_mask, gradient_mode=gradient_mode))
                 start = end
             else:
                 out.append(None)
 
         return out, (k, v)
-
-
-@at.typecheck
-class FeedForward(nn.Module):
-    """Feed forward module."""
-
-    features: int
-    hidden_dim: int
-
-    @nn.compact
-    def __call__(self, x):
-        dtype = x.dtype  # original dtype, could be half-precision
-        w_gating = self.param(
-            "gating_einsum",
-            nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
-            (2, self.features, self.hidden_dim),
-        ).astype(dtype)
-        ff_gate = jnp.dot(x, w_gating[0])
-        gate_value = nn.gelu(ff_gate)
-
-        ff1 = jnp.dot(x, w_gating[1])
-        activations = gate_value * ff1
-
-        w_linear = self.param(
-            "linear",
-            nn.initializers.lecun_normal(in_axis=-2, out_axis=-1),
-            (self.hidden_dim, self.features),
-        ).astype(dtype)
-        outputs = jnp.dot(activations, w_linear)
-        assert outputs.dtype == dtype
-        return outputs
 
 
 @at.typecheck
@@ -290,7 +296,7 @@ class Block(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
+    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True, audio_mask=None, gradient_mode=None):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -305,7 +311,7 @@ class Block(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache, audio_mask=audio_mask, gradient_mode=gradient_mode)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
@@ -316,12 +322,16 @@ class Block(nn.Module):
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is not None:
                 x, gate = RMSNorm(name=_name("pre_ffw_norm", i))(x, adarms_cond[i])  # noqa: PLW2901
+                # audio_mask and audio_lora only apply to first expert (PaliGemma prefix)
+                expert_audio_mask = audio_mask if (i == 0 and audio_mask is not None) else None
+                audio_lora_ffn = config.audio_lora_configs.get("ffn")
                 x = lora.FeedForward(  # noqa: PLW2901
                     features=config.width,
                     hidden_dim=config.mlp_dim,
                     name=_name("mlp", i),
                     lora_config=config.lora_configs.get("ffn"),
-                )(x)
+                    audio_lora_config=audio_lora_ffn,
+                )(x, audio_mask=expert_audio_mask, gradient_mode=gradient_mode)
             out.append(x)
             gates.append(gate if x is not None else None)
 
@@ -372,7 +382,9 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic
+                nn.broadcast,
+                nn.broadcast,
+            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic, 5=audio_mask, 6=gradient_mode
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -385,6 +397,10 @@ class Module(nn.Module):
     def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
         return self.embedder.encode(tokens).astype(self.embed_dtype)
 
+    def decode(self, hidden: at.Float[at.Array, "b t d"]) -> at.Float[at.Array, "b t v"]:
+        """Project hidden states back to vocabulary logits."""
+        return self.embedder.decode(hidden)
+
     @at.typecheck
     def __call__(
         self,
@@ -396,13 +412,17 @@ class Module(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
+        audio_mask: at.Bool[at.Array, "b _s"] | None = None,
+        gradient_mode: str | None = None,
     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        # Encode gradient_mode as jnp.int32 for JAX-compatible tracing through nn.scan.
+        gradient_mode_int = lora.encode_gradient_mode(gradient_mode) if gradient_mode is not None else None
+        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic, audio_mask, gradient_mode_int)
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 

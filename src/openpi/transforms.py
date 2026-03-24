@@ -337,6 +337,322 @@ class PadStatesAndActions(DataTransformFn):
         return data
 
 
+@dataclasses.dataclass(frozen=True)
+class AudioPreprocess(DataTransformFn):
+    """Preprocesses audio into Whisper-compatible format for the model.
+
+    Supports two modes:
+    1. **Cached** (fast): If "audio_whisper_hidden" is already in data (precomputed),
+       passes it through directly. No mel computation needed.
+    2. **Live** (slow): If "audio_waveform" is in data, computes (128, 3000) mel spectrogram
+       for live Whisper encoding in the model.
+
+    If neither is present, produces zeros with audio_mask=False.
+    """
+
+    sample_rate: int = 16000
+    n_mels: int = 128
+    n_fft: int = 400
+    hop_length: int = 160
+    max_duration: float = 30.0  # Whisper expects 30s
+
+    def __call__(self, data: DataDict) -> DataDict:
+        target_length = int(self.max_duration * self.sample_rate)  # 480000
+        n_frames = 3000  # Whisper mel frames for 30s
+
+        if "audio_whisper_hidden" in data and data["audio_whisper_hidden"] is not None:
+            # Precomputed Whisper embeddings — no mel needed
+            data["audio_mask"] = np.bool_(True)
+            # Still need a dummy audio field for Observation dataclass (won't be used)
+            if "audio" not in data:
+                data["audio"] = np.zeros((self.n_mels, n_frames), dtype=np.float32)
+            data.pop("audio_waveform", None)
+        elif "audio_waveform" in data and data["audio_waveform"] is not None:
+            waveform = np.asarray(data.pop("audio_waveform"), dtype=np.float32)
+
+            # Pad or trim to 30s
+            if len(waveform) < target_length:
+                waveform = np.pad(waveform, (0, target_length - len(waveform)))
+            else:
+                waveform = waveform[:target_length]
+
+            # Compute log-mel spectrogram using numpy
+            mel = self._compute_mel_spectrogram(waveform)
+            data["audio"] = mel  # (128, 3000)
+            data["audio_mask"] = np.bool_(True)
+        else:
+            # No audio - provide zeros with mask=False
+            data["audio"] = np.zeros((self.n_mels, n_frames), dtype=np.float32)
+            data["audio_mask"] = np.bool_(False)
+            data.pop("audio_waveform", None)
+
+        return data
+
+    def _compute_mel_spectrogram(self, waveform: np.ndarray) -> np.ndarray:
+        """Compute log-mel spectrogram matching Whisper preprocessing."""
+        # STFT
+        window = np.hanning(self.n_fft + 1)[:-1].astype(np.float32)
+        stft_frames = []
+        for i in range(0, len(waveform) - self.n_fft + 1, self.hop_length):
+            frame = waveform[i:i + self.n_fft] * window
+            spectrum = np.fft.rfft(frame)
+            stft_frames.append(np.abs(spectrum) ** 2)
+
+        if not stft_frames:
+            return np.zeros((self.n_mels, 3000), dtype=np.float32)
+
+        magnitudes = np.stack(stft_frames, axis=0).T  # (n_fft//2+1, num_frames)
+
+        # Mel filterbank
+        mel_filters = self._mel_filterbank(self.n_mels, self.n_fft, self.sample_rate)
+        mel_spec = mel_filters @ magnitudes  # (n_mels, num_frames)
+
+        # Log scale (matching Whisper)
+        log_spec = np.log10(np.maximum(mel_spec, 1e-10))
+        log_spec = np.maximum(log_spec, log_spec.max() - 8.0)
+        log_spec = (log_spec + 4.0) / 4.0
+
+        # Pad or trim to 3000 frames
+        target_frames = 3000
+        if log_spec.shape[1] < target_frames:
+            log_spec = np.pad(log_spec, ((0, 0), (0, target_frames - log_spec.shape[1])))
+        else:
+            log_spec = log_spec[:, :target_frames]
+
+        return log_spec.astype(np.float32)
+
+    @staticmethod
+    def _mel_filterbank(n_mels: int, n_fft: int, sample_rate: int) -> np.ndarray:
+        """Create mel filterbank matrix."""
+
+        def hz_to_mel(hz):
+            return 2595.0 * np.log10(1.0 + hz / 700.0)
+
+        def mel_to_hz(mel):
+            return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
+
+        low_freq_mel = 0.0
+        high_freq_mel = hz_to_mel(sample_rate / 2)
+        mel_points = np.linspace(low_freq_mel, high_freq_mel, n_mels + 2)
+        hz_points = mel_to_hz(mel_points)
+        bin_points = np.floor((n_fft + 1) * hz_points / sample_rate).astype(int)
+
+        filters = np.zeros((n_mels, n_fft // 2 + 1))
+        for i in range(n_mels):
+            for j in range(bin_points[i], bin_points[i + 1]):
+                filters[i, j] = (j - bin_points[i]) / max(bin_points[i + 1] - bin_points[i], 1)
+            for j in range(bin_points[i + 1], bin_points[i + 2]):
+                filters[i, j] = (bin_points[i + 2] - j) / max(bin_points[i + 2] - bin_points[i + 1], 1)
+
+        return filters
+
+
+@dataclasses.dataclass(frozen=True)
+class AudioTextMixingTransform(DataTransformFn):
+    """Injects TTS audio into training samples.
+
+    With probability `audio_ratio`, looks up a pre-synthesized TTS audio file
+    for the current prompt and injects it as `audio_waveform`.
+
+    If `whisper_cache_dir` is set, also loads the precomputed Whisper encoder
+    embedding (.npy file) as `audio_whisper_hidden`, avoiding live Whisper
+    computation during training (~2x speedup).
+
+    If `clear_prompt` is True (Stage 2 style), clears the text prompt when
+    audio is injected so the model must rely on audio alone.
+    If False (Stage 1 style), keeps text alongside audio for teacher forcing.
+
+    If `auxiliary_tts_dir` is set, with probability `auxiliary_ratio` a random
+    prompt+audio pair is drawn from the auxiliary manifest instead of matching
+    the episode's prompt. This allows mixing in out-of-domain TTS data (e.g.
+    DROID instructions during LIBERO training) for acoustic diversity. The
+    episode's text prompt is replaced with the auxiliary prompt for ASR targets.
+    """
+
+    audio_ratio: float = 1.0
+    tts_cache_dir: str = ""
+    whisper_cache_dir: str = ""
+    clear_prompt: bool = False
+    auxiliary_tts_dir: str = ""
+    auxiliary_whisper_cache_dir: str = ""
+    auxiliary_ratio: float = 0.0
+
+    def __post_init__(self):
+        object.__setattr__(self, "_manifest", None)
+        object.__setattr__(self, "_aux_manifest", None)
+        object.__setattr__(self, "_aux_prompts", None)
+        object.__setattr__(self, "_rng", None)
+
+    def _load_manifest(self, tts_dir: str) -> dict:
+        import json
+        import pathlib
+
+        manifest_path = pathlib.Path(tts_dir) / "manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"TTS manifest not found at {manifest_path}. "
+                "Run scripts/synthesize_tts.py first to generate the TTS cache."
+            )
+        with open(manifest_path) as f:
+            return json.load(f)
+
+    def _get_manifest(self) -> dict:
+        if self._manifest is None:
+            object.__setattr__(self, "_manifest", self._load_manifest(self.tts_cache_dir))
+        return self._manifest
+
+    def _get_aux_manifest(self) -> dict:
+        if self._aux_manifest is None:
+            manifest = self._load_manifest(self.auxiliary_tts_dir)
+            object.__setattr__(self, "_aux_manifest", manifest)
+            object.__setattr__(self, "_aux_prompts", list(manifest.keys()))
+        return self._aux_manifest
+
+    def _get_rng(self):
+        import random
+        if self._rng is None:
+            object.__setattr__(self, "_rng", random.Random())
+        return self._rng
+
+    def _load_audio(self, audio_path: str, tts_dir: str, whisper_cache_dir: str, data: DataDict):
+        """Load audio as precomputed Whisper embedding or raw waveform."""
+        import pathlib
+
+        if whisper_cache_dir:
+            tts_base = pathlib.Path(tts_dir)
+            cache_base = pathlib.Path(whisper_cache_dir)
+            audio_p = pathlib.Path(audio_path)
+            try:
+                rel_path = audio_p.relative_to(tts_base)
+            except ValueError:
+                try:
+                    rel_path = audio_p.relative_to(tts_base.resolve())
+                except ValueError:
+                    # audio_path may be absolute from a different machine;
+                    # extract relative part after the tts dir name.
+                    tts_name = tts_base.name  # e.g. "libero_train"
+                    parts = audio_p.parts
+                    for i, part in enumerate(parts):
+                        if part == tts_name:
+                            rel_path = pathlib.Path(*parts[i + 1:])
+                            break
+                    else:
+                        # Last resort: use just the filename
+                        rel_path = pathlib.Path(audio_p.name)
+            cache_path = cache_base / rel_path.with_suffix(".npy")
+            if cache_path.exists():
+                data["audio_whisper_hidden"] = np.load(cache_path)  # (1500, 1280)
+                return
+        # Fallback to live Whisper — load waveform
+        import librosa
+        waveform, _ = librosa.load(audio_path, sr=16000)
+        data["audio_waveform"] = waveform.astype(np.float32)
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if not self.tts_cache_dir:
+            return data
+
+        rng = self._get_rng()
+
+        prompt = data.get("prompt", "")
+        if isinstance(prompt, np.ndarray):
+            prompt = str(prompt.item()) if prompt.ndim == 0 else str(prompt)
+
+        if rng.random() < self.audio_ratio and prompt:
+            # Decide whether to use auxiliary TTS (out-of-domain, e.g. DROID)
+            use_auxiliary = (
+                self.auxiliary_tts_dir
+                and self.auxiliary_ratio > 0
+                and rng.random() < self.auxiliary_ratio
+            )
+
+            if use_auxiliary:
+                aux_manifest = self._get_aux_manifest()
+                aux_prompt = rng.choice(self._aux_prompts)
+                audio_files = aux_manifest[aux_prompt]
+                audio_path = rng.choice(audio_files)
+                self._load_audio(audio_path, self.auxiliary_tts_dir, self.auxiliary_whisper_cache_dir, data)
+                # Replace prompt so ASR targets match the audio content
+                data["prompt"] = np.asarray(aux_prompt)
+            else:
+                manifest = self._get_manifest()
+                audio_files = manifest.get(prompt)
+                if audio_files:
+                    audio_path = rng.choice(audio_files)
+                    self._load_audio(audio_path, self.tts_cache_dir, self.whisper_cache_dir, data)
+
+            if self.clear_prompt:
+                # Save the original prompt before clearing so that ASR rehearsal
+                # in Stage 2 can still produce meaningful target tokens.
+                current_prompt = data.get("prompt", "")
+                if isinstance(current_prompt, np.ndarray):
+                    current_prompt = str(current_prompt.item()) if current_prompt.ndim == 0 else str(current_prompt)
+                if current_prompt:
+                    data["original_prompt"] = current_prompt
+                data["prompt"] = np.asarray("")
+
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class GenerateASRTargets(DataTransformFn):
+    """Generates ASR target tokens for ASR loss.
+
+    Must be applied AFTER TokenizePrompt. In Stage 1 (text not cleared),
+    simply copies tokenized_prompt into asr_target_tokens. In Stage 2
+    (clear_prompt=True), if ``original_prompt`` exists, tokenizes it to
+    produce ASR targets with the original instruction text, since
+    tokenized_prompt is empty after clearing.
+
+    When ``original_prompt`` is tokenized, the result is also stored in
+    ``original_tokenized_prompt`` / ``original_tokenized_prompt_mask`` so
+    the model can use the full instruction text as prefix input during the
+    ASR rehearsal forward pass.
+
+    Args:
+        tokenizer: Optional PaligemmaTokenizer instance. Required when
+            ``original_prompt`` may be present (Stage 2). If not provided,
+            falls back to copying tokenized_prompt (Stage 1 behavior).
+        max_token_len: Maximum token length for tokenization.
+        discrete_state_input: Whether to include state in tokenization.
+    """
+
+    tokenizer: _tokenizer.PaligemmaTokenizer | None = None
+
+    def __call__(self, data: DataDict) -> DataDict:
+        original_prompt = data.pop("original_prompt", None)
+
+        if "tokenized_prompt" not in data or "tokenized_prompt_mask" not in data:
+            return data
+
+        if original_prompt is not None and self.tokenizer is not None:
+            # Stage 2 path: original_prompt was saved before clearing.
+            # Tokenize the original instruction text for ASR targets and
+            # as the prefix input for the ASR rehearsal forward pass.
+            if not isinstance(original_prompt, str):
+                original_prompt = str(original_prompt)
+
+            orig_tokens, orig_mask = self.tokenizer.tokenize(original_prompt)
+
+            data["asr_target_tokens"] = orig_tokens
+            data["asr_target_mask"] = orig_mask
+            data["original_tokenized_prompt"] = orig_tokens.copy()
+            data["original_tokenized_prompt_mask"] = orig_mask.copy()
+        else:
+            # Stage 1 path (or no clearing): copy tokenized_prompt as-is.
+            data["asr_target_tokens"] = data["tokenized_prompt"].copy()
+            data["asr_target_mask"] = data["tokenized_prompt_mask"].copy()
+
+            # When tokenizer is provided (audio-enabled model), always produce
+            # original_tokenized_prompt for shape consistency across batches.
+            # If text wasn't cleared, the original IS the current prompt.
+            if self.tokenizer is not None:
+                data["original_tokenized_prompt"] = data["tokenized_prompt"].copy()
+                data["original_tokenized_prompt_mask"] = data["tokenized_prompt_mask"].copy()
+
+        return data
+
+
 def flatten_dict(tree: at.PyTree) -> dict:
     """Flatten a nested dictionary. Uses '/' as the separator."""
     return traverse_util.flatten_dict(tree, sep="/")

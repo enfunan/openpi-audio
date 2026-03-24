@@ -99,6 +99,29 @@ class Observation(Generic[ArrayT]):
     # Tokenized prompt mask.
     tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Audio fields.
+
+    # Mel spectrogram from Whisper preprocessing: (128, 3000) for 30s audio.
+    audio: at.Float[ArrayT, "*b mel time"] | None = None
+    # Precomputed Whisper encoder hidden states: (1500, 1280). When present, skip live Whisper.
+    audio_whisper_hidden: at.Float[ArrayT, "*b seq dim"] | None = None
+    # True if audio is valid for this sample (False for text-only samples).
+    audio_mask: at.Bool[ArrayT, "*b"] | None = None
+
+    # ASR rehearsal fields (for split LoRA training).
+
+    # Target text tokens for ASR loss computation.
+    asr_target_tokens: at.Int[ArrayT, "*b l"] | None = None
+    # Mask for valid ASR target tokens.
+    asr_target_mask: at.Bool[ArrayT, "*b l"] | None = None
+
+    # Original (un-cleared) tokenized prompt for Stage 2 ASR rehearsal.
+    # When clear_prompt_for_audio=True, tokenized_prompt is empty. These fields
+    # store the original instruction text tokens so ASR rehearsal can still
+    # predict meaningful text.
+    original_tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
+    original_tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
+
     # pi0-fast model specific fields.
 
     # Token auto-regressive mask (for FAST autoregressive model).
@@ -124,6 +147,13 @@ class Observation(Generic[ArrayT]):
             state=data["state"],
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
+            audio=data.get("audio"),
+            audio_whisper_hidden=data.get("audio_whisper_hidden"),
+            audio_mask=data.get("audio_mask"),
+            asr_target_tokens=data.get("asr_target_tokens"),
+            asr_target_mask=data.get("asr_target_mask"),
+            original_tokenized_prompt=data.get("original_tokenized_prompt"),
+            original_tokenized_prompt_mask=data.get("original_tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
         )
@@ -203,6 +233,12 @@ def preprocess_observation(
         state=observation.state,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
+        audio=observation.audio,
+        audio_mask=observation.audio_mask,
+        asr_target_tokens=observation.asr_target_tokens,
+        asr_target_mask=observation.asr_target_mask,
+        original_tokenized_prompt=observation.original_tokenized_prompt,
+        original_tokenized_prompt_mask=observation.original_tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
     )
@@ -242,8 +278,40 @@ class BaseModelConfig(abc.ABC):
 
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
-        model = pi0_pytorch.PI0Pytorch(config=train_config.model)
-        safetensors.torch.load_model(model, weight_path)
+        model_cfg = train_config.model
+        model = pi0_pytorch.PI0Pytorch(config=model_cfg)
+
+        # Inject Split LoRA before loading if checkpoint has LoRA weights
+        audio_enabled = getattr(model_cfg, "audio_enabled", False)
+        if audio_enabled:
+            from openpi.models_pytorch.lora_pytorch import LoRAConfig, inject_lora
+            lora_rank = 16
+            task_cfg = LoRAConfig(rank=lora_rank, alpha=float(lora_rank))
+            audio_cfg = LoRAConfig(rank=lora_rank, alpha=float(lora_rank))
+            inject_lora(
+                model.paligemma_with_expert.paligemma.language_model,
+                model.paligemma_with_expert.gemma_expert.model,
+                task_cfg=task_cfg,
+                audio_cfg=audio_cfg,
+            )
+            logger.info("Split LoRA injected for audio-enabled model")
+
+        state_dict = safetensors.torch.load_file(weight_path)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if unexpected:
+            logger.warning(f"Unexpected keys in checkpoint (ignored): {unexpected}")
+        if missing:
+            logger.warning(f"Missing keys in checkpoint: {missing}")
+
+        # Re-tie embed_tokens ↔ lm_head (safetensors deduplicates shared weights).
+        pali = getattr(model, "paligemma_with_expert", None)
+        if pali is not None:
+            lm = getattr(pali.paligemma, "language_model", None) or getattr(pali.paligemma.model, "language_model", None)
+            lm_head = getattr(pali.paligemma, "lm_head", None)
+            if lm is not None and lm_head is not None and hasattr(lm, "embed_tokens"):
+                lm.embed_tokens.weight = lm_head.weight
+                logger.info("Re-tied embed_tokens.weight ← lm_head.weight after checkpoint load")
+
         return model
 
     @abc.abstractmethod

@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 
 import torch
 from torch import Tensor
@@ -8,6 +9,7 @@ import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
+from openpi.models_pytorch.lora_pytorch import GRAD_MODE_ASR, GRAD_MODE_BYPASS, GRAD_MODE_FLOW_MATCHING
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
 
@@ -81,6 +83,68 @@ def make_att_2d_masks(pad_masks, att_masks):
     return att_2d_masks & pad_2d_masks
 
 
+class AudioProjectorPT(nn.Module):
+    """Projects Whisper hidden states to Gemma embedding dimension.
+
+    5:1 temporal downsampling via reshape, then 2-layer MLP.
+    (B, 1500, whisper_dim) → (B, 300, output_dim)
+    """
+
+    def __init__(self, whisper_dim: int = 1280, output_dim: int = 2048, temporal_factor: int = 5):
+        super().__init__()
+        self.temporal_factor = temporal_factor
+        hidden_dim = whisper_dim * temporal_factor  # 6400
+        self.proj_in = nn.Linear(hidden_dim, output_dim)
+        self.proj_out = nn.Linear(output_dim, output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, S, D = x.shape
+        new_S = S // self.temporal_factor
+        x = x[:, :new_S * self.temporal_factor, :]
+        x = x.reshape(B, new_S, D * self.temporal_factor)
+        x = F.gelu(self.proj_in(x))
+        return self.proj_out(x)
+
+
+class AttentionPoolingPT(nn.Module):
+    """Cross-attention pooling: (B, 300, D) → (B, num_queries, D)."""
+
+    def __init__(self, num_queries: int = 32, dim: int = 2048, num_heads: int = 8):
+        super().__init__()
+        self.num_queries = num_queries
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.queries = nn.Parameter(torch.randn(num_queries, dim) * 0.02)
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+        q = self.queries.unsqueeze(0).expand(B, -1, -1)  # (B, Q, D)
+        q = self.q_proj(q)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # Reshape for multi-head attention
+        q = q.view(B, self.num_queries, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, k.shape[1], self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, v.shape[1], self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Scaled dot-product attention
+        scale = self.head_dim ** -0.5
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        attn = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v)
+
+        # Reshape back
+        out = out.transpose(1, 2).reshape(B, self.num_queries, self.dim)
+        return self.out_proj(out)
+
+
 class PI0Pytorch(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -108,8 +172,33 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        # Audio components
+        self.audio_enabled = getattr(config, "audio_enabled", False)
+        self.training_stage = getattr(config, "training_stage", "default")
+        self.rehearsal_lambda = getattr(config, "rehearsal_lambda", 0.01)
+
+        if self.audio_enabled:
+            self.audio_num_tokens = getattr(config, "audio_num_tokens", 32)
+            paligemma_width = paligemma_config.width  # e.g. 2048
+            whisper_dim = 1280  # whisper-large-v3 hidden dim
+
+            # Whisper encoder (frozen — loaded separately via weight loader)
+            from transformers import WhisperModel
+            whisper_variant = getattr(config, "whisper_variant", "openai/whisper-large-v3")
+            self.whisper_encoder = WhisperModel.from_pretrained(whisper_variant).encoder
+            self.whisper_encoder.requires_grad_(False)
+
+            # Audio projector: (B, 1500, 1280) → (B, 300, paligemma_width)
+            self.audio_projector = AudioProjectorPT(whisper_dim=whisper_dim, output_dim=paligemma_width)
+
+            # Attention pooling: (B, 300, D) → (B, num_queries, D)
+            self.attention_pooling = AttentionPoolingPT(
+                num_queries=self.audio_num_tokens, dim=paligemma_width,
+            )
+
         torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        if os.environ.get("OPENPI_NO_COMPILE", "") != "1":
+            self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -156,18 +245,15 @@ class PI0Pytorch(nn.Module):
     def _prepare_attention_masks_4d(self, att_2d_masks):
         """Helper method to prepare 4D attention masks for transformer."""
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
-        return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
+        # Use the model's dtype so SDPA bias matches query dtype
+        model_dtype = self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+        min_val = torch.finfo(model_dtype).min
+        return torch.where(att_2d_masks_4d, 0.0, min_val).to(dtype=model_dtype)
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
         observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
-        return (
-            list(observation.images.values()),
-            list(observation.image_masks.values()),
-            observation.tokenized_prompt,
-            observation.tokenized_prompt_mask,
-            observation.state,
-        )
+        return observation
 
     def sample_noise(self, shape, device):
         return torch.normal(
@@ -184,14 +270,23 @@ class PI0Pytorch(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images with SigLIP and language tokens with embedding layer to prepare
-        for PaliGemma transformer processing.
+        self, images, img_masks, lang_tokens, lang_masks,
+        audio_whisper_hidden=None, audio=None, audio_mask=None, causal_text=False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Embed images (+ audio) + language tokens for PaliGemma transformer processing.
+
+        Returns:
+            embs, pad_masks, att_masks, audio_position_mask
+            audio_position_mask is (B, S) bool, True at audio token positions. None if no audio.
         """
+        # If we have mel spectrogram but no precomputed whisper hidden, run encoder
+        if self.audio_enabled and audio_whisper_hidden is None and audio is not None:
+            with torch.no_grad():
+                audio_whisper_hidden = self.whisper_encoder(audio).last_hidden_state  # (B, 1500, 1280)
         embs = []
         pad_masks = []
         att_masks = []
+        audio_position_mask_parts = []
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
@@ -205,9 +300,35 @@ class PI0Pytorch(nn.Module):
 
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
-
-            # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
+
+            if self.audio_enabled:
+                audio_position_mask_parts.append(
+                    torch.zeros(bsize, num_img_embs, dtype=torch.bool, device=img.device)
+                )
+
+        # Process audio (symmetric prefix — always present when audio_enabled)
+        if self.audio_enabled and audio_whisper_hidden is not None:
+            audio_hidden = audio_whisper_hidden  # (B, 1500, 1280) precomputed
+            audio_tokens = self.audio_projector(audio_hidden)  # (B, 300, D)
+            audio_tokens = self.attention_pooling(audio_tokens)  # (B, num_queries, D)
+
+            # Zero out audio tokens where audio_mask is False (text-only samples)
+            if audio_mask is not None:
+                audio_tokens = audio_tokens * audio_mask[:, None, None].float()
+
+            embs.append(audio_tokens)
+            audio_seq_len = audio_tokens.shape[1]
+
+            if audio_mask is not None:
+                pad_masks.append(audio_mask[:, None].expand(bsize, audio_seq_len))
+            else:
+                pad_masks.append(torch.ones(bsize, audio_seq_len, dtype=torch.bool, device=audio_tokens.device))
+
+            att_masks += [0] * audio_seq_len
+            audio_position_mask_parts.append(
+                torch.ones(bsize, audio_seq_len, dtype=torch.bool, device=audio_tokens.device)
+            )
 
         # Process language tokens
         def lang_embed_func(lang_tokens):
@@ -220,19 +341,29 @@ class PI0Pytorch(nn.Module):
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
 
-        # full attention between image and language inputs
         num_lang_embs = lang_emb.shape[1]
-        att_masks += [0] * num_lang_embs
+        if causal_text:
+            att_masks += [1] * num_lang_embs
+        else:
+            att_masks += [0] * num_lang_embs
+
+        if self.audio_enabled:
+            audio_position_mask_parts.append(
+                torch.zeros(bsize, num_lang_embs, dtype=torch.bool, device=lang_emb.device)
+            )
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
 
-        # Get batch size from the first dimension of the concatenated tensors
         bsize = pad_masks.shape[0]
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+        att_masks = att_masks[None, :].expand(bsize, att_masks.shape[0])
 
-        return embs, pad_masks, att_masks
+        audio_position_mask = None
+        if self.audio_enabled and audio_position_mask_parts:
+            audio_position_mask = torch.cat(audio_position_mask_parts, dim=1)
+
+        return embs, pad_masks, att_masks, audio_position_mask
 
     def embed_suffix(self, state, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -313,9 +444,173 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+    def compute_alignment_loss(self, observation, gradient_mode=None):
+        """Compute autoregressive ASR cross-entropy loss (Stage 1 or rehearsal).
+
+        Uses causal attention for text positions and shifted next-token prediction.
+        """
+        obs = self._preprocess_observation(observation, train=self.training)
+        images = list(obs.images.values())
+        img_masks = list(obs.image_masks.values())
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks, audio_position_mask = self.embed_prefix(
+            images, img_masks, obs.tokenized_prompt, obs.tokenized_prompt_mask,
+            audio_whisper_hidden=obs.audio_whisper_hidden, audio=getattr(obs, "audio", None),
+            audio_mask=obs.audio_mask, causal_text=True,
+        )
+
+        # Cast if needed
+        if self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+
+        att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        # Forward through PaliGemma only (prefix-only path with LoRA routing)
+        (prefix_out, _), _ = self.paligemma_with_expert.forward(
+            attention_mask=att_2d_masks_4d,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=False,
+            adarms_cond=[None, None],
+            audio_mask=audio_position_mask,
+            gradient_mode=gradient_mode,
+        )
+
+        # Decode to vocabulary logits
+        logits = self.paligemma_with_expert.decode_to_vocab(prefix_out)  # (B, S, vocab_size)
+
+        # Compute shifted next-token prediction loss on text positions
+        asr_target_tokens = obs.asr_target_tokens
+        asr_target_mask = obs.asr_target_mask
+        if asr_target_tokens is None or asr_target_mask is None:
+            return torch.tensor(0.0, device=prefix_embs.device)
+
+        text_len = asr_target_tokens.shape[1]
+        text_logits = logits[:, -text_len:, :]  # (B, L, vocab_size)
+
+        # Shifted prediction: logits[i] predicts token[i+1]
+        shifted_logits = text_logits[:, :-1, :].float()  # (B, L-1, V)
+        shifted_targets = asr_target_tokens[:, 1:]  # (B, L-1)
+        shifted_mask = asr_target_mask[:, 1:].float()  # (B, L-1)
+
+        log_probs = F.log_softmax(shifted_logits, dim=-1)
+        token_losses = -torch.gather(log_probs, 2, shifted_targets.unsqueeze(-1).long()).squeeze(-1)
+        masked_losses = token_losses * shifted_mask
+        loss = masked_losses.sum() / shifted_mask.sum().clamp(min=1.0)
+        return loss
+
+    def compute_asr_loss_for_rehearsal(self, observation):
+        """Compute ASR loss with gradient_mode=ASR for Stage 2 rehearsal.
+
+        Swaps original_tokenized_prompt back if available (cleared in Stage 2).
+        """
+        obs = observation
+        # If original prompt tokens exist, swap them in for the ASR pass
+        if getattr(obs, "original_tokenized_prompt", None) is not None:
+            class _SwappedObs:
+                pass
+            swapped = _SwappedObs()
+            for attr in dir(obs):
+                if not attr.startswith("_"):
+                    setattr(swapped, attr, getattr(obs, attr))
+            swapped.tokenized_prompt = obs.original_tokenized_prompt
+            swapped.tokenized_prompt_mask = obs.original_tokenized_prompt_mask
+            obs = swapped
+        return self.compute_alignment_loss(obs, gradient_mode=GRAD_MODE_ASR)
+
+    @torch.no_grad()
+    def compute_teacher_velocity(self, observation, actions, noise, time):
+        """Teacher forward: run text oracle (base weights only, LoRA bypassed).
+
+        Uses original_tokenized_prompt (text) instead of audio, and sets
+        gradient_mode=GRAD_MODE_BYPASS so all LoRA layers return base_linear(x).
+        Returns the predicted velocity v_t (detached).
+        """
+        # Build a shallow copy of observation with text prompt restored and audio cleared
+        class _TeacherObs:
+            pass
+        tobs = _TeacherObs()
+        for attr in dir(observation):
+            if not attr.startswith("_"):
+                try:
+                    setattr(tobs, attr, getattr(observation, attr))
+                except Exception:
+                    pass
+        # Swap in original text prompt
+        if getattr(observation, "original_tokenized_prompt", None) is not None:
+            tobs.tokenized_prompt = observation.original_tokenized_prompt
+            tobs.tokenized_prompt_mask = observation.original_tokenized_prompt_mask
+        # Clear audio so embed_prefix uses text path only
+        tobs.audio_mask = None
+        tobs.audio_whisper_hidden = None
+        if hasattr(tobs, "audio"):
+            tobs.audio = None
+
+        obs = self._preprocess_observation(tobs, train=True)
+        images = list(obs.images.values())
+        img_masks = list(obs.image_masks.values())
+
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks, audio_position_mask = self.embed_prefix(
+            images, img_masks, obs.tokenized_prompt, obs.tokenized_prompt_mask,
+            audio_whisper_hidden=None, audio=None, audio_mask=None,
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(obs.state, x_t, time)
+        if (
+            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            attention_mask=att_2d_masks_4d,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            adarms_cond=[None, adarms_cond],
+            audio_mask=None,
+            gradient_mode=GRAD_MODE_BYPASS,
+        )
+
+        suffix_out = suffix_out[:, -self.config.action_horizon:]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        v_t = self.action_out_proj(suffix_out)
+        return v_t
+
+    def forward(self, observation, actions, noise=None, time=None,
+                training_stage=None, gradient_mode=None,
+                return_intermediates=False) -> Tensor:
+        """Training forward pass. Returns per-element MSE loss or ASR scalar loss.
+
+        If return_intermediates=True, returns (loss, noise, time) so the caller
+        can reuse the same noise/time for distillation teacher forward.
+        """
+        # Allow training_stage override from caller (training loop), else use config
+        stage = training_stage or self.training_stage
+
+        # Stage 1: ASR alignment only
+        if stage == "asr_alignment":
+            asr_loss = self.compute_alignment_loss(observation, gradient_mode=GRAD_MODE_ASR)
+            batch_size = observation.state.shape[0] if hasattr(observation, "state") else actions.shape[0]
+            return asr_loss.expand(batch_size, 1)
+
+        # Default: flow matching loss
+        obs = self._preprocess_observation(observation, train=True)
+        images = list(obs.images.values())
+        img_masks = list(obs.image_masks.values())
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -327,8 +622,15 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        # Determine gradient_mode for split LoRA
+        gm = GRAD_MODE_FLOW_MATCHING if self.audio_enabled else gradient_mode
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks, audio_position_mask = self.embed_prefix(
+            images, img_masks, obs.tokenized_prompt, obs.tokenized_prompt_mask,
+            audio_whisper_hidden=obs.audio_whisper_hidden, audio=getattr(obs, "audio", None),
+            audio_mask=obs.audio_mask,
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(obs.state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -342,10 +644,8 @@ class PI0Pytorch(nn.Module):
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
-        # Prepare attention masks
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
-        # Apply gradient checkpointing if enabled
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
             (_, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
@@ -354,6 +654,8 @@ class PI0Pytorch(nn.Module):
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
+                audio_mask=audio_position_mask,
+                gradient_mode=gm,
             )
             return suffix_out
 
@@ -364,13 +666,15 @@ class PI0Pytorch(nn.Module):
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
 
-        # Apply gradient checkpointing to final action projection if enabled
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        loss = F.mse_loss(u_t, v_t, reduction="none")
+        if return_intermediates:
+            return loss, noise, time
+        return loss
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
@@ -380,9 +684,17 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        obs = self._preprocess_observation(observation, train=False)
+        images = list(obs.images.values())
+        img_masks = list(obs.image_masks.values())
+        state = obs.state
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks, audio_position_mask = self.embed_prefix(
+            images, img_masks, obs.tokenized_prompt, obs.tokenized_prompt_mask,
+            audio_whisper_hidden=getattr(obs, "audio_whisper_hidden", None),
+            audio=getattr(obs, "audio", None),
+            audio_mask=getattr(obs, "audio_mask", None),
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
@@ -396,6 +708,7 @@ class PI0Pytorch(nn.Module):
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
+            audio_mask=audio_position_mask,
         )
 
         dt = -1.0 / num_steps

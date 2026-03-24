@@ -32,6 +32,17 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Audio VLA v2 options.
+    audio_enabled: bool = False
+    whisper_variant: str = "openai/whisper-large-v3"
+    audio_num_tokens: int = 32
+    # ASR rehearsal loss weight (Stage 2).
+    rehearsal_lambda: float = 0.01
+    # Distillation loss weight (Stage 2): force audio velocity to match text oracle velocity.
+    distill_lambda: float = 0.0
+    # Training stage: "default" (flow matching) or "asr_alignment" (Stage 1 ASR only).
+    training_stage: str = "default"
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
@@ -56,6 +67,26 @@ class Pi0Config(_model.BaseModelConfig):
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
+        audio_spec = None
+        audio_whisper_hidden_spec = None
+        audio_mask_spec = None
+        if self.audio_enabled:
+            audio_spec = jax.ShapeDtypeStruct([batch_size, 128, 3000], jnp.float32)
+            # Precomputed Whisper encoder output: (B, 1500, 1280)
+            audio_whisper_hidden_spec = jax.ShapeDtypeStruct([batch_size, 1500, 1280], jnp.float32)
+            audio_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+
+        # Original prompt fields for Stage 2 ASR rehearsal (when text is cleared).
+        original_tokenized_prompt_spec = None
+        original_tokenized_prompt_mask_spec = None
+        asr_target_tokens_spec = None
+        asr_target_mask_spec = None
+        if self.audio_enabled:
+            asr_target_tokens_spec = jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32)
+            asr_target_mask_spec = jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool)
+            original_tokenized_prompt_spec = jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32)
+            original_tokenized_prompt_mask_spec = jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool)
+
         with at.disable_typechecking():
             observation_spec = _model.Observation(
                 images={
@@ -71,6 +102,13 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                audio=audio_spec,
+                audio_whisper_hidden=audio_whisper_hidden_spec,
+                audio_mask=audio_mask_spec,
+                asr_target_tokens=asr_target_tokens_spec,
+                asr_target_mask=asr_target_mask_spec,
+                original_tokenized_prompt=original_tokenized_prompt_spec,
+                original_tokenized_prompt_mask=original_tokenized_prompt_mask_spec,
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 
@@ -103,6 +141,11 @@ class Pi0Config(_model.BaseModelConfig):
             filters.append(
                 nnx.Not(nnx_utils.PathRegex(".*lora.*")),
             )
+
+        if self.audio_enabled:
+            # Always freeze whisper encoder weights.
+            filters.append(nnx.Not(nnx_utils.PathRegex(".*whisper.*")))
+
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)

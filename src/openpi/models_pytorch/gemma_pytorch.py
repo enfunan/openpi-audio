@@ -36,7 +36,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         vlm_config_hf.text_config.use_adarms = use_adarms[0]
         vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
         vlm_config_hf.vision_config.intermediate_size = 4304
-        vlm_config_hf.vision_config.projection_dim = 2048
+        vlm_config_hf.vision_config.projection_dim = vlm_config.width
         vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
         vlm_config_hf.vision_config.torch_dtype = "float32"
 
@@ -76,6 +76,8 @@ class PaliGemmaWithExpertModel(nn.Module):
             "input_layernorm",
             "post_attention_layernorm",
             "model.norm",
+            # LoRA params must stay float32 for numerical stability
+            "task_A", "task_B", "audio_A", "audio_B",
         ]
 
         for name, param in self.named_parameters():
@@ -88,6 +90,78 @@ class PaliGemmaWithExpertModel(nn.Module):
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)
 
+    def _forward_prefix_with_lora(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        adarms_cond,
+        audio_mask: torch.Tensor | None = None,
+        gradient_mode: int | None = None,
+    ) -> torch.Tensor:
+        """Forward pass through PaliGemma language model only, with LoRA routing.
+
+        Used for ASR alignment where we need audio_mask/gradient_mode threaded
+        through every projection but only process the prefix (no action expert).
+        """
+        model = self.paligemma.language_model
+        num_layers = len(model.layers)
+        lora_kw = dict(audio_mask=audio_mask, gradient_mode=gradient_mode) if audio_mask is not None else {}
+
+        for layer_idx in range(num_layers):
+            layer = model.layers[layer_idx]
+            residual = hidden_states
+            hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond)
+
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+            query_state = layer.self_attn.q_proj(hidden_states, **lora_kw).view(hidden_shape).transpose(1, 2)
+            key_state = layer.self_attn.k_proj(hidden_states, **lora_kw).view(hidden_shape).transpose(1, 2)
+            value_state = layer.self_attn.v_proj(hidden_states, **lora_kw).view(hidden_shape).transpose(1, 2)
+
+            dummy_tensor = torch.zeros(
+                query_state.shape[0], query_state.shape[2], query_state.shape[-1],
+                device=query_state.device, dtype=query_state.dtype,
+            )
+            cos, sin = self.paligemma.model.language_model.rotary_emb(dummy_tensor, position_ids)
+            query_state, key_state = modeling_gemma.apply_rotary_pos_emb(
+                query_state, key_state, cos, sin, unsqueeze_dim=1,
+            )
+
+            scaling = layer.self_attn.scaling
+            att_output, _ = modeling_gemma.eager_attention_forward(
+                layer.self_attn, query_state, key_state, value_state, attention_mask, scaling,
+            )
+            head_dim = layer.self_attn.head_dim
+            num_heads = layer.self_attn.config.num_attention_heads
+            att_output = att_output.reshape(hidden_states.shape[0], -1, num_heads * head_dim)
+
+            if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+                att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+            att_output = layer.self_attn.o_proj(att_output, **lora_kw)
+
+            hidden_states = modeling_gemma._gated_residual(residual, att_output, gate)  # noqa: SLF001
+            residual2 = hidden_states
+            hidden_states, gate2 = layer.post_attention_layernorm(hidden_states, cond=adarms_cond)
+            if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+                hidden_states = hidden_states.to(dtype=torch.bfloat16)
+            hidden_states = layer.mlp(hidden_states, **lora_kw)
+            hidden_states = modeling_gemma._gated_residual(residual2, hidden_states, gate2)  # noqa: SLF001
+
+        hidden_states, _ = model.norm(hidden_states, cond=adarms_cond)
+        return hidden_states
+
+    def decode_to_vocab(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project hidden states to vocabulary logits via PaliGemma embedding transpose.
+
+        Args:
+            hidden_states: (B, S, D) hidden states from the language model.
+
+        Returns:
+            (B, S, vocab_size) logits.
+        """
+        return torch.matmul(hidden_states, self.paligemma.language_model.embed_tokens.weight.T)
+
     def forward(
         self,
         attention_mask: torch.Tensor | None = None,
@@ -96,10 +170,20 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        audio_mask: torch.Tensor | None = None,
+        gradient_mode: int | None = None,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
+            # Prefix-only forward (KV cache computation or ASR alignment).
+            # Build extra kwargs for LoRA routing if audio_mask is present.
+            extra_kwargs = {}
+            if audio_mask is not None:
+                extra_kwargs["audio_mask"] = audio_mask
+            if gradient_mode is not None:
+                extra_kwargs["gradient_mode"] = gradient_mode
+
             prefix_output = self.paligemma.language_model.forward(
                 inputs_embeds=inputs_embeds[0],
                 attention_mask=attention_mask,
@@ -107,6 +191,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
+                **extra_kwargs,
             )
             prefix_past_key_values = prefix_output.past_key_values
             prefix_output = prefix_output.last_hidden_state
@@ -167,11 +252,14 @@ class PaliGemmaWithExpertModel(nn.Module):
                     hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
                     gates.append(gate)
 
+                    # LoRA kwargs: PaliGemma (i==0) gets audio routing; action expert (i==1) does not.
+                    lora_kw = dict(audio_mask=audio_mask, gradient_mode=gradient_mode) if i == 0 and audio_mask is not None else {}
+
                     input_shape = hidden_states.shape[:-1]
                     hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
-                    query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-                    key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-                    value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                    query_state = layer.self_attn.q_proj(hidden_states, **lora_kw).view(hidden_shape).transpose(1, 2)
+                    key_state = layer.self_attn.k_proj(hidden_states, **lora_kw).view(hidden_shape).transpose(1, 2)
+                    value_state = layer.self_attn.v_proj(hidden_states, **lora_kw).view(hidden_shape).transpose(1, 2)
 
                     query_states.append(query_state)
                     key_states.append(key_state)
@@ -217,9 +305,11 @@ class PaliGemmaWithExpertModel(nn.Module):
                     layer = models[i].layers[layer_idx]
                     end_pos = start_pos + hidden_states.shape[1]
 
+                    lora_kw = dict(audio_mask=audio_mask, gradient_mode=gradient_mode) if i == 0 and audio_mask is not None else {}
+
                     if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
                         att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
-                    out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
+                    out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos], **lora_kw)
 
                     # first residual
                     out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
@@ -229,7 +319,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                     if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
                         out_emb = out_emb.to(dtype=torch.bfloat16)
 
-                    out_emb = layer.mlp(out_emb)
+                    out_emb = layer.mlp(out_emb, **lora_kw)
                     # second residual
                     out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
                     outputs_embeds.append(out_emb)

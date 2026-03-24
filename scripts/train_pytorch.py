@@ -36,12 +36,14 @@ import numpy as np
 import safetensors.torch
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F  # noqa: N812
 import torch.nn.parallel
 import tqdm
 import wandb
 
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
+from openpi.models_pytorch.lora_pytorch import GRAD_MODE_FLOW_MATCHING, LoRAConfig, inject_lora
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
@@ -146,7 +148,62 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+class ExponentialMovingAverage:
+    """Maintains exponential moving averages of trainable model parameters.
+
+    Shadow params are kept in float32 on GPU (same device as model) for fast
+    updates. Only moved to CPU during checkpoint save.
+    """
+
+    def __init__(self, model, decay: float = 0.999):
+        self.decay = decay
+        self.num_updates = 0
+        # Pre-build (name, param, shadow) triples for fast iteration
+        raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        self._params = []
+        self.shadow = {}
+        for name, param in raw_model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.float().clone()  # same device as param
+                self._params.append((name, param, self.shadow[name]))
+
+    @torch.no_grad()
+    def update(self, model):
+        self.num_updates += 1
+        decay = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
+        for name, param, shadow in self._params:
+            # In-place update on GPU — no CPU transfer
+            shadow.mul_(decay).add_(param.data.float(), alpha=1 - decay)
+
+    def state_dict(self):
+        # Move shadow to CPU for serialization
+        return {
+            "shadow": {k: v.cpu() for k, v in self.shadow.items()},
+            "decay": self.decay,
+            "num_updates": self.num_updates,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.decay = state_dict["decay"]
+        self.num_updates = state_dict["num_updates"]
+        # Move loaded shadow back to same device as current shadow
+        for name in self.shadow:
+            if name in state_dict["shadow"]:
+                self.shadow[name].copy_(state_dict["shadow"][name])
+        # Rebuild _params references
+        self._params = [(n, p, self.shadow[n]) for n, p, _ in self._params]
+
+    def apply_shadow_to_model(self, model):
+        """Copy EMA weights into a model state dict for saving/inference."""
+        raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        model_sd = raw_model.state_dict()
+        for name, shadow in self.shadow.items():
+            if name in model_sd:
+                model_sd[name] = shadow.to(dtype=model_sd[name].dtype)
+        return model_sd
+
+
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, ema=None):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
         return
@@ -166,6 +223,14 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
         safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
 
+        # Save EMA weights for inference (preferred over raw training weights)
+        if ema is not None:
+            ema_sd = ema.apply_shadow_to_model(model)
+            # Cast to bfloat16 for compact inference checkpoint
+            ema_sd = {k: v.to(torch.bfloat16) for k, v in ema_sd.items()}
+            safetensors.torch.save_file(ema_sd, tmp_ckpt_dir / "model_ema.safetensors")
+            torch.save(ema.state_dict(), tmp_ckpt_dir / "ema_state.pt")
+
         # Save optimizer state using PyTorch format
         torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
 
@@ -174,6 +239,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             "global_step": global_step,
             "config": dataclasses.asdict(config),
             "timestamp": time.time(),
+            "ema_enabled": ema is not None,
         }
         torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
 
@@ -194,7 +260,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             wandb.log({"checkpoint_step": global_step}, step=global_step)
 
 
-def load_checkpoint(model, optimizer, checkpoint_dir, device):
+def load_checkpoint(model, optimizer, checkpoint_dir, device, ema=None, skip_optimizer=False):
     """Load the latest checkpoint and return the global step."""
     checkpoint_steps = [
         int(d.name)
@@ -222,6 +288,28 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
         if safetensors_path.exists():
             model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
             safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
+            # Re-tie shared weights that safetensors deduplicates during save.
+            # PaliGemma ties embed_tokens.weight ↔ lm_head.weight; safetensors
+            # only saves one copy, so the other is stale after load_model.
+            sd = model_to_load.state_dict()
+            ptrs = {}
+            retied = []
+            for k, v in sd.items():
+                p = v.data_ptr()
+                if p in ptrs:
+                    retied.append((ptrs[p], k))
+                else:
+                    ptrs[p] = k
+            if not retied:
+                # No ties found — weights were de-duplicated by safetensors.
+                # Copy lm_head → embed_tokens (or any shared pair).
+                pali = getattr(model_to_load, "paligemma_with_expert", None)
+                if pali is not None:
+                    lm = getattr(pali.paligemma, "language_model", None) or getattr(pali.paligemma.model, "language_model", None)
+                    lm_head = getattr(pali.paligemma, "lm_head", None)
+                    if lm is not None and lm_head is not None and hasattr(lm, "embed_tokens"):
+                        lm.embed_tokens.weight = lm_head.weight
+                        logging.info("Re-tied embed_tokens.weight ← lm_head.weight after checkpoint load")
             logging.info("Loaded model state from safetensors format")
         else:
             raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
@@ -231,17 +319,20 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
         log_memory_usage(device, latest_step, "after_loading_model")
 
         # Load optimizer state with error handling
-        logging.info("Loading optimizer state...")
-        optimizer_path = ckpt_dir / "optimizer.pt"
-
-        if optimizer_path.exists():
-            optimizer_state_dict = torch.load(optimizer_path, map_location=device, weights_only=False)
-            logging.info("Loaded optimizer state from pt format")
+        if skip_optimizer:
+            logging.info("Skipping optimizer state load (--reset-optimizer)")
         else:
-            raise FileNotFoundError(f"No optimizer checkpoint found at {ckpt_dir}")
+            logging.info("Loading optimizer state...")
+            optimizer_path = ckpt_dir / "optimizer.pt"
 
-        optimizer.load_state_dict(optimizer_state_dict)
-        del optimizer_state_dict
+            if optimizer_path.exists():
+                optimizer_state_dict = torch.load(optimizer_path, map_location=device, weights_only=False)
+                logging.info("Loaded optimizer state from pt format")
+            else:
+                raise FileNotFoundError(f"No optimizer checkpoint found at {ckpt_dir}")
+
+            optimizer.load_state_dict(optimizer_state_dict)
+            del optimizer_state_dict
         torch.cuda.empty_cache()
         gc.collect()
         log_memory_usage(device, latest_step, "after_loading_optimizer")
@@ -254,6 +345,15 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
         torch.cuda.empty_cache()
         gc.collect()
         log_memory_usage(device, latest_step, "after_loading_metadata")
+
+        # Load EMA state if available
+        if ema is not None:
+            ema_path = ckpt_dir / "ema_state.pt"
+            if ema_path.exists():
+                ema.load_state_dict(torch.load(ema_path, map_location="cpu", weights_only=False))
+                logging.info(f"Loaded EMA state (num_updates={ema.num_updates})")
+            else:
+                logging.info("No EMA state found in checkpoint, starting fresh EMA")
 
         logging.info(f"Successfully loaded all checkpoint components from step {latest_step}")
         return global_step
@@ -307,6 +407,9 @@ def log_memory_usage(device, step, phase="unknown"):
 
 
 def train_loop(config: _config.TrainConfig):
+    # Set CUDA allocator config before any CUDA calls
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128,expandable_segments:True")
+
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
@@ -351,6 +454,11 @@ def train_loop(config: _config.TrainConfig):
     # For N GPUs, each GPU should get batch_size/N samples, so total across all GPUs is batch_size
     world_size = torch.distributed.get_world_size() if use_ddp else 1
     effective_batch_size = config.batch_size // world_size
+    if effective_batch_size == 0:
+        raise ValueError(
+            f"batch_size ({config.batch_size}) < world_size ({world_size}). "
+            f"Use --batch-size={world_size} or higher."
+        )
     logging.info(
         f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
     )
@@ -408,45 +516,87 @@ def train_loop(config: _config.TrainConfig):
 
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
+    # --- Audio / Split LoRA setup ---
+    audio_enabled = getattr(model_cfg, "audio_enabled", False)
+    training_stage = getattr(model_cfg, "training_stage", "default")
+    rehearsal_lambda = getattr(model_cfg, "rehearsal_lambda", 0.01)
+    distill_lambda = getattr(model_cfg, "distill_lambda", 0.0)
+    is_stage2_load = audio_enabled and training_stage == "default"
+
+    # Stage 1: load base weights BEFORE LoRA injection (checkpoint has original Linear keys)
+    # Stage 2: load AFTER LoRA injection (checkpoint has LoRA A/B weights from Stage 1)
+    if config.pytorch_weight_path is not None and not is_stage2_load:
+        logging.info(f"Loading base weights from: {config.pytorch_weight_path}")
+        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
+        pretrained_sd = safetensors.torch.load_file(model_path)
+        missing, unexpected = model.load_state_dict(pretrained_sd, strict=False)
+        if missing:
+            logging.info(f"Keys in model but not in checkpoint ({len(missing)}): {missing[:5]}...")
+        if unexpected:
+            logging.warning(f"Unexpected keys in checkpoint ({len(unexpected)}): {unexpected[:5]}...")
+        logging.info(f"Loaded {len(pretrained_sd)} weights from {config.pytorch_weight_path}")
+
+    if audio_enabled:
+        lora_rank = 16
+        task_cfg = LoRAConfig(rank=lora_rank, alpha=float(lora_rank))
+        audio_cfg = LoRAConfig(rank=lora_rank, alpha=float(lora_rank))
+        inject_lora(
+            model.paligemma_with_expert.paligemma.language_model,
+            model.paligemma_with_expert.gemma_expert.model,
+            task_cfg=task_cfg,
+            audio_cfg=audio_cfg,
+        )
+        model = model.to(device)  # ensure new LoRA params are on device
+
+        # Freeze base model weights (LoRA params stay trainable)
+        for name, param in model.named_parameters():
+            if "base_linear" in name:
+                param.requires_grad_(False)
+
+        # Freeze Whisper encoder
+        if hasattr(model, "whisper_encoder"):
+            model.whisper_encoder.requires_grad_(False)
+
+        # Log trainable params
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        logging.info(f"Split LoRA injected: {trainable:,} trainable / {total:,} total params")
+
+    # Stage 2: load Stage 1 checkpoint AFTER LoRA injection (has LoRA + audio projector weights)
+    if config.pytorch_weight_path is not None and is_stage2_load:
+        logging.info(f"Loading Stage 1 checkpoint for Stage 2: {config.pytorch_weight_path}")
+        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
+        pretrained_sd = safetensors.torch.load_file(model_path)
+        missing, unexpected = model.load_state_dict(pretrained_sd, strict=False)
+        if missing:
+            logging.info(f"Keys in model but not in Stage 1 checkpoint ({len(missing)}): {missing[:5]}...")
+        if unexpected:
+            logging.warning(f"Unexpected keys in Stage 1 checkpoint ({len(unexpected)}): {unexpected[:5]}...")
+        logging.info(f"Loaded {len(pretrained_sd)} Stage 1 weights (incl. LoRA + audio projector)")
+
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
         model.gradient_checkpointing_enable()
         logging.info("Enabled gradient checkpointing for memory optimization")
-    else:
-        enable_gradient_checkpointing = False
-        logging.info("Gradient checkpointing is not supported for this model")
 
     # Log initial memory usage after model creation
     if is_main and torch.cuda.is_available():
         log_memory_usage(device, 0, "after_model_creation")
 
-    # Enable memory optimizations for large-scale training
-    if world_size >= 8:
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        # Set memory allocation configuration
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
-        logging.info("Enabled memory optimizations for 8+ GPU training")
+    # Enable memory/compute optimizations
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     if use_ddp:
+        # Stage 2 dual backward (flow matching + ASR) uses different graphs per step,
+        # so static_graph must be False. Stage 1 can use static_graph for efficiency.
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=True,  # Disable for memory efficiency
-            gradient_as_bucket_view=True,  # Enable for memory efficiency
-            static_graph=world_size >= 8,  # Enable for 8+ GPUs
+            gradient_as_bucket_view=True,
+            static_graph=not is_stage2_load,
         )
-
-    # Load weights from weight_loader if specified (for fine-tuning)
-    if config.pytorch_weight_path is not None:
-        logging.info(f"Loading weights from: {config.pytorch_weight_path}")
-
-        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
-        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
@@ -454,20 +604,63 @@ def train_loop(config: _config.TrainConfig):
     decay_steps = config.lr_schedule.decay_steps
     end_lr = config.lr_schedule.decay_lr
 
+    # Build parameter groups with stage-dependent LR multipliers
+    base_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    is_stage2 = training_stage == "default" and audio_enabled
+    audio_proj_params = []
+    audio_lora_params = []
+    other_params = []
+    for name, param in base_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "audio_projector" in name or "attention_pooling" in name:
+            audio_proj_params.append(param)
+        elif is_stage2 and ("audio_A" in name or "audio_B" in name):
+            audio_lora_params.append(param)
+        else:
+            other_params.append(param)
+
+    # Stage 1: projector 50×, everything else 1×
+    # Stage 2: projector 10×, audio LoRA 0.25×, task LoRA 1×
+    proj_mult = 10.0 if is_stage2 else 50.0
+    if audio_proj_params:
+        param_groups = [
+            {"params": other_params, "lr": peak_lr},
+            {"params": audio_proj_params, "lr": peak_lr * proj_mult},
+        ]
+        if audio_lora_params:
+            param_groups.append({"params": audio_lora_params, "lr": peak_lr * 0.25})
+            logging.info(f"Stage 2 param groups: {len(other_params)} task/other at 1× LR, {len(audio_proj_params)} proj/pool at {proj_mult}× LR, {len(audio_lora_params)} audio LoRA at 0.25× LR")
+        else:
+            logging.info(f"Audio param groups: {len(audio_proj_params)} proj/pool params at {proj_mult}× LR, {len(other_params)} others at base LR")
+    else:
+        param_groups = [{"params": other_params, "lr": peak_lr}]
+
     # Create optimizer with config parameters
     optim = torch.optim.AdamW(
-        model.parameters(),
+        param_groups,
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
         weight_decay=config.optimizer.weight_decay,
     )
 
+    # Initialize EMA before resume so checkpoint can restore EMA state
+    ema = None
+    if config.ema_decay is not None and is_main:
+        ema = ExponentialMovingAverage(model, decay=config.ema_decay)
+        ema_mem_gb = sum(p.numel() * 4 for p in model.parameters() if p.requires_grad) / 1e9
+        logging.info(f"EMA enabled: decay={config.ema_decay}, shadow memory ~{ema_mem_gb:.1f}GB (GPU float32)")
+
     # Load checkpoint if resuming
     global_step = 0
     if resuming:
-        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
-        logging.info(f"Resumed training from step {global_step}")
+        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device, ema=ema, skip_optimizer=config.reset_optimizer)
+        if config.reset_optimizer:
+            logging.info(f"Reset optimizer and step counter (loaded weights from step {global_step})")
+            global_step = 0
+        else:
+            logging.info(f"Resumed training from step {global_step}")
 
     def lr_schedule(step: int):
         if step < warmup_steps:
@@ -480,6 +673,7 @@ def train_loop(config: _config.TrainConfig):
         return end_lr + (peak_lr - end_lr) * cos
 
     model.train()
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     start_time = time.time()
     infos = []  # Collect stats over log interval
     if is_main:
@@ -496,7 +690,7 @@ def train_loop(config: _config.TrainConfig):
         logging.info(
             f"Optimizer: {type(config.optimizer).__name__}, weight_decay={config.optimizer.weight_decay}, clip_norm={config.optimizer.clip_gradient_norm}"
         )
-        logging.info("EMA is not supported for PyTorch training")
+        logging.info(f"EMA: {'enabled, decay=' + str(config.ema_decay) if ema else 'disabled'}")
         logging.info(f"Training precision: {model_cfg.dtype}")
 
     # Training loop - iterate until we reach num_train_steps
@@ -517,53 +711,199 @@ def train_loop(config: _config.TrainConfig):
                 break
 
             # The unified data loader returns (observation, actions) tuple
-            observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
-            actions = actions.to(torch.float32)  # noqa: PLW2901
-            actions = actions.to(device)  # noqa: PLW2901
+            observation = jax.tree.map(lambda x: x.to(device) if isinstance(x, torch.Tensor) else x, observation)  # noqa: PLW2901
+            actions = actions.to(device=device, dtype=torch.float32)  # noqa: PLW2901
 
-            # Update LR
-            for pg in optim.param_groups:
-                pg["lr"] = lr_schedule(global_step)
+            # Update LR with per-group multipliers
+            # Group 0: task LoRA / other (1×)
+            # Group 1: audio projector/pooling (proj_mult×)
+            # Group 2 (Stage 2 only): audio LoRA (0.25×)
+            base_lr = lr_schedule(global_step)
+            for pg_idx, pg in enumerate(optim.param_groups):
+                if pg_idx == 1 and audio_enabled:
+                    pg["lr"] = base_lr * proj_mult
+                elif pg_idx == 2 and is_stage2:
+                    pg["lr"] = base_lr * 0.25
+                else:
+                    pg["lr"] = base_lr
 
-            # Forward pass
-            losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
+            # Determine if we need dual gradient (Stage 2 rehearsal)
+            has_rehearsal = (
+                audio_enabled and training_stage == "default"
+                and rehearsal_lambda > 0
+            )
+            has_distill = (
+                audio_enabled and training_stage == "default"
+                and distill_lambda > 0
+            )
+            loss_asr_val = 0.0
+            loss_distill_val = 0.0
+            nan_skipped = False
 
-            loss = losses.mean()
+            if training_stage == "asr_alignment":
+                # Stage 1: single ASR forward pass
+                losses = model(observation, actions, training_stage="asr_alignment")
+                if isinstance(losses, list | tuple):
+                    losses = torch.stack(losses)
+                elif not isinstance(losses, torch.Tensor):
+                    losses = torch.tensor(losses, device=device, dtype=torch.float32)
+                loss = losses.mean()
+                loss.backward()
 
-            # Backward pass
-            loss.backward()
+            elif has_rehearsal:
+                # Stage 2: dual/triple gradient (flow matching + ASR rehearsal + optional distillation)
+                inner_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+
+                # First backward: flow matching (detach audio LoRA)
+                # Use return_intermediates to get noise/time for distillation
+                if use_ddp:
+                    model.require_backward_grad_sync = False
+                result = model(observation, actions, gradient_mode=GRAD_MODE_FLOW_MATCHING,
+                               return_intermediates=has_distill)
+                if has_distill:
+                    losses, fm_noise, fm_time = result
+                else:
+                    losses = result
+                if isinstance(losses, list | tuple):
+                    losses = torch.stack(losses)
+                elif not isinstance(losses, torch.Tensor):
+                    losses = torch.tensor(losses, device=device, dtype=torch.float32)
+                loss_fm = losses.mean()
+                loss_fm.backward()
+
+                # Save flow matching gradients
+                grads_fm = {}
+                for n, p in model.named_parameters():
+                    if p.grad is not None:
+                        grads_fm[n] = p.grad.clone()
+                optim.zero_grad(set_to_none=True)
+
+                # Optional: distillation backward (teacher = text oracle via base weights)
+                if has_distill:
+                    if use_ddp:
+                        model.require_backward_grad_sync = False
+                    # Teacher: text oracle velocity (no grad, LoRA bypassed)
+                    v_teacher = inner_model.compute_teacher_velocity(
+                        observation, actions, fm_noise, fm_time)
+                    # Student: audio velocity (same noise/time, LoRA active)
+                    student_losses, _, _ = model(
+                        observation, actions, noise=fm_noise, time=fm_time,
+                        gradient_mode=GRAD_MODE_FLOW_MATCHING,
+                        return_intermediates=True)
+                    # We need v_t from student — recompute forward to get velocity
+                    # Actually, the MSE loss already captures the difference.
+                    # Instead, compute distillation as MSE between student and teacher velocities.
+                    # Re-run student forward to get v_t directly:
+                    obs_inner = inner_model._preprocess_observation(observation, train=True)
+                    images_d = list(obs_inner.images.values())
+                    img_masks_d = list(obs_inner.image_masks.values())
+                    time_exp = fm_time[:, None, None]
+                    x_t_d = time_exp * fm_noise + (1 - time_exp) * actions
+                    prefix_embs, prefix_pad_masks, prefix_att_masks, audio_pos_mask = inner_model.embed_prefix(
+                        images_d, img_masks_d, obs_inner.tokenized_prompt, obs_inner.tokenized_prompt_mask,
+                        audio_whisper_hidden=obs_inner.audio_whisper_hidden,
+                        audio=getattr(obs_inner, "audio", None),
+                        audio_mask=obs_inner.audio_mask,
+                    )
+                    suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond_d = inner_model.embed_suffix(
+                        obs_inner.state, x_t_d, fm_time)
+                    # Cast to bfloat16 if model weights are bf16 (matches regular forward())
+                    if (
+                        inner_model.paligemma_with_expert.paligemma.language_model
+                        .layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16
+                    ):
+                        prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+                        suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+                    pad_masks_d = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+                    att_masks_d = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+                    from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
+                    att_2d_d = make_att_2d_masks(pad_masks_d, att_masks_d)
+                    pos_ids_d = torch.cumsum(pad_masks_d, dim=1) - 1
+                    att_4d_d = inner_model._prepare_attention_masks_4d(att_2d_d)
+                    # gradient_mode=None: both task + audio LoRA get distill gradients.
+                    # This is intentional — distillation teaches the audio pathway to
+                    # produce text-oracle-like velocities, so audio LoRA MUST be updated.
+                    (_, suff_out_d), _ = inner_model.paligemma_with_expert.forward(
+                        attention_mask=att_4d_d, position_ids=pos_ids_d,
+                        past_key_values=None, inputs_embeds=[prefix_embs, suffix_embs],
+                        use_cache=False, adarms_cond=[None, adarms_cond_d],
+                        audio_mask=audio_pos_mask, gradient_mode=None,
+                    )
+                    suff_out_d = suff_out_d[:, -inner_model.config.action_horizon:]
+                    v_student = inner_model.action_out_proj(suff_out_d.float())
+                    loss_distill = F.mse_loss(v_student, v_teacher.detach())
+                    loss_distill.backward()
+                    loss_distill_val = loss_distill.item()
+
+                    # Save distillation gradients and combine with flow matching
+                    for n, p in model.named_parameters():
+                        if p.grad is not None and n in grads_fm:
+                            grads_fm[n] = grads_fm[n] + distill_lambda * p.grad
+                        # If only distill grad exists (unlikely), add it
+                        elif p.grad is not None:
+                            grads_fm[n] = distill_lambda * p.grad.clone()
+                    optim.zero_grad(set_to_none=True)
+                    del fm_noise, fm_time
+
+                # ASR rehearsal backward (detach task LoRA)
+                if use_ddp:
+                    model.require_backward_grad_sync = True
+                loss_asr = inner_model.compute_asr_loss_for_rehearsal(observation)
+                loss_asr.backward()
+                loss_asr_val = loss_asr.item()
+
+                # Combine gradients: grad = grad_fm [+ α·grad_distill] + λ·grad_asr
+                for n, p in model.named_parameters():
+                    if p.grad is not None and n in grads_fm:
+                        p.grad = grads_fm[n] + rehearsal_lambda * p.grad
+                    elif n in grads_fm:
+                        p.grad = grads_fm[n]
+                del grads_fm
+                loss = loss_fm
+
+            else:
+                # Standard flow matching (no audio or no rehearsal)
+                losses = model(observation, actions)
+                if isinstance(losses, list | tuple):
+                    losses = torch.stack(losses)
+                elif not isinstance(losses, torch.Tensor):
+                    losses = torch.tensor(losses, device=device, dtype=torch.float32)
+                loss = losses.mean()
+                loss.backward()
 
             # Log memory usage after backward pass
             if global_step < 5 and is_main and torch.cuda.is_available():
                 log_memory_usage(device, global_step, "after_backward")
 
-            # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+            # Gradient clipping (trainable params only)
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=config.optimizer.clip_gradient_norm)
 
-            # Optimizer step
-            optim.step()
-            optim.zero_grad(set_to_none=True)
-
-            # Clear gradients more aggressively
-            for param in model.parameters():
-                if param.grad is not None:
-                    param.grad.detach_()
-                    param.grad = None
+            # NaN gradient guard
+            if not torch.isfinite(grad_norm):
+                logging.warning(f"Step {global_step}: NaN/Inf grad_norm ({grad_norm:.4f}), skipping")
+                optim.zero_grad(set_to_none=True)
+                nan_skipped = True
+            else:
+                # Optimizer step
+                optim.step()
+                optim.zero_grad(set_to_none=True)
+                # Update EMA shadow params
+                if ema is not None:
+                    ema.update(model)
 
             # Collect stats
             if is_main:
-                infos.append(
-                    {
-                        "loss": loss.item(),
-                        "learning_rate": optim.param_groups[0]["lr"],
-                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                    }
-                )
+                info = {
+                    "loss": loss.item(),
+                    "learning_rate": optim.param_groups[0]["lr"],
+                    "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                    "nan_skipped": 1.0 if nan_skipped else 0.0,
+                }
+                if has_rehearsal:
+                    info["loss_asr"] = loss_asr_val
+                if has_distill:
+                    info["loss_distill"] = loss_distill_val
+                infos.append(info)
 
             if is_main and (global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
@@ -571,6 +911,7 @@ def train_loop(config: _config.TrainConfig):
                 # Average stats over log interval
                 avg_loss = sum(info["loss"] for info in infos) / len(infos)
                 avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
+                avg_nan_skipped = sum(info.get("nan_skipped", 0.0) for info in infos) / len(infos)
 
                 avg_grad_norm = None
                 if any("grad_norm" in info for info in infos):
@@ -579,11 +920,29 @@ def train_loop(config: _config.TrainConfig):
                     ]
                     if len(vals) > 0:
                         avg_grad_norm = sum(vals) / len(vals)
-                logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
-                    if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
-                )
+
+                log_parts = [f"step={global_step}", f"loss={avg_loss:.4f}", f"lr={avg_lr:.2e}"]
+                if avg_grad_norm is not None:
+                    log_parts.append(f"grad_norm={avg_grad_norm:.2f}")
+                if avg_nan_skipped > 0:
+                    log_parts.append(f"nan_skipped={avg_nan_skipped:.2f}")
+
+                avg_loss_asr = None
+                if any("loss_asr" in info for info in infos):
+                    asr_vals = [info["loss_asr"] for info in infos if "loss_asr" in info]
+                    if asr_vals:
+                        avg_loss_asr = sum(asr_vals) / len(asr_vals)
+                        log_parts.append(f"loss_asr={avg_loss_asr:.4f}")
+
+                avg_loss_distill = None
+                if any("loss_distill" in info for info in infos):
+                    distill_vals = [info["loss_distill"] for info in infos if "loss_distill" in info]
+                    if distill_vals:
+                        avg_loss_distill = sum(distill_vals) / len(distill_vals)
+                        log_parts.append(f"loss_distill={avg_loss_distill:.4f}")
+
+                log_parts.append(f"time={elapsed:.1f}s")
+                logging.info(" ".join(log_parts))
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
@@ -592,9 +951,14 @@ def train_loop(config: _config.TrainConfig):
                         "learning_rate": avg_lr,
                         "step": global_step,
                         "time_per_step": elapsed / config.log_interval,
+                        "nan_skipped": avg_nan_skipped,
                     }
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
+                    if avg_loss_asr is not None:
+                        log_payload["loss_asr"] = avg_loss_asr
+                    if avg_loss_distill is not None:
+                        log_payload["loss_distill"] = avg_loss_distill
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()
@@ -602,7 +966,7 @@ def train_loop(config: _config.TrainConfig):
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            save_checkpoint(model, optim, global_step, config, is_main, data_config, ema=ema)
 
             # Update progress bar
             if pbar is not None:

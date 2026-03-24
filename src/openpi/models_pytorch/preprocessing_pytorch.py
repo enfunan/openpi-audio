@@ -170,4 +170,12 @@ def preprocess_observation_pytorch(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        # Audio fields (may be None if audio is not enabled)
+        audio_whisper_hidden=getattr(observation, "audio_whisper_hidden", None),
+        audio=getattr(observation, "audio", None),  # mel spectrogram for live Whisper
+        audio_mask=getattr(observation, "audio_mask", None),
+        asr_target_tokens=getattr(observation, "asr_target_tokens", None),
+        asr_target_mask=getattr(observation, "asr_target_mask", None),
+        original_tokenized_prompt=getattr(observation, "original_tokenized_prompt", None),
+        original_tokenized_prompt_mask=getattr(observation, "original_tokenized_prompt_mask", None),
     )

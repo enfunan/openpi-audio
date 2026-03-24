@@ -155,11 +155,59 @@ def train_step(
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+
+    # Check if we need dual gradient computation (Stage 2 with split LoRA).
+    has_rehearsal = (
+        hasattr(config.model, "audio_enabled")
+        and config.model.audio_enabled
+        and hasattr(config.model, "training_stage")
+        and config.model.training_stage == "default"
+        and hasattr(config.model, "rehearsal_lambda")
+        and config.model.rehearsal_lambda > 0
+        and observation.asr_target_tokens is not None
+    )
+
+    if has_rehearsal:
+        # Dual gradient computation for Stage 2:
+        # Pass 1: Flow matching loss (gradient_mode="flow_matching" set inside model)
+        loss_fm, grads_fm = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+
+        # Pass 2: ASR rehearsal loss (gradient_mode="asr" set explicitly)
+        @at.typecheck
+        def asr_loss_fn(model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation):
+            return model.compute_asr_loss_for_rehearsal(rng, observation, train=True)
+
+        asr_rng = jax.random.fold_in(train_rng, 1)
+        loss_asr, grads_asr = nnx.value_and_grad(asr_loss_fn, argnums=diff_state)(model, asr_rng, observation)
+
+        # Combine: grads = grads_fm + lambda * grads_asr
+        rehearsal_lambda = config.model.rehearsal_lambda
+        grads = jax.tree.map(lambda a, b: a + rehearsal_lambda * b, grads_fm, grads_asr)
+        loss = loss_fm
+    else:
+        loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+        loss_asr = jnp.float32(0.0)
+
+    # Apply per-parameter LR scaling by scaling gradients before the optimizer.
+    for filt, scale in config.lr_scale_overrides.items():
+        grads = nnx_utils.state_map(grads, filt, lambda p: p.replace(p.value * scale))
+
+    grad_norm = optax.global_norm(grads)
+    grad_finite = jnp.isfinite(grad_norm)
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
     new_params = optax.apply_updates(params, updates)
+
+    # NaN gradient guard: skip parameter update when gradients contain NaN/Inf.
+    # bfloat16 forward pass can overflow on certain batches; discarding the step
+    # is safer than corrupting all parameters with a NaN update.
+    new_params = jax.tree.map(
+        lambda new, old: jnp.where(grad_finite, new, old), new_params, params
+    )
+    new_opt_state = jax.tree.map(
+        lambda new, old: jnp.where(grad_finite, new, old), new_opt_state, state.opt_state
+    )
 
     # Update the model in place and return the new full state.
     nnx.update(model, new_params)
@@ -185,9 +233,12 @@ def train_step(
     )
     info = {
         "loss": loss,
-        "grad_norm": optax.global_norm(grads),
+        "grad_norm": grad_norm,
         "param_norm": optax.global_norm(kernel_params),
+        "nan_skipped": jnp.where(grad_finite, 0.0, 1.0),
     }
+    if has_rehearsal:
+        info["loss_asr"] = loss_asr
     return new_state, info
 
 
@@ -263,8 +314,11 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
+            info_str = ", ".join(
+                f"{k}={float(v):.4f}" if isinstance(v, (int, float, np.floating, np.integer)) else f"{k}={v}"
+                for k, v in reduced_info.items()
+            )
+            logging.info(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
         batch = next(data_iter)

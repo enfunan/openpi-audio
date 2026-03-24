@@ -121,8 +121,8 @@ class GemmaMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    def forward(self, x, **kwargs):
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x, **kwargs)) * self.up_proj(x, **kwargs), **kwargs)
         return down_proj
 
 
@@ -288,13 +288,20 @@ class GemmaAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         use_cache: bool = False,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:        
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # Extract LoRA routing kwargs (audio_mask, gradient_mode) if present
+        lora_kw = {}
+        if "audio_mask" in kwargs:
+            lora_kw["audio_mask"] = kwargs.pop("audio_mask")
+        if "gradient_mode" in kwargs:
+            lora_kw["gradient_mode"] = kwargs.pop("gradient_mode")
+
+        query_states = self.q_proj(hidden_states, **lora_kw).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states, **lora_kw).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states, **lora_kw).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -325,7 +332,7 @@ class GemmaAttention(nn.Module):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.o_proj(attn_output, **lora_kw)
         return attn_output, attn_weights
 
 
@@ -354,6 +361,13 @@ class GemmaDecoderLayer(GradientCheckpointingLayer):
         adarms_cond: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        # Extract LoRA routing kwargs to pass through to MLP (attn gets them via **kwargs)
+        lora_kw = {}
+        if "audio_mask" in kwargs:
+            lora_kw["audio_mask"] = kwargs["audio_mask"]  # don't pop — attn needs them too
+        if "gradient_mode" in kwargs:
+            lora_kw["gradient_mode"] = kwargs["gradient_mode"]
+
         residual = hidden_states
         hidden_states, gate = self.input_layernorm(hidden_states, adarms_cond)
 
@@ -374,7 +388,7 @@ class GemmaDecoderLayer(GradientCheckpointingLayer):
         # Fully Connected
         residual = hidden_states
         hidden_states, gate = self.post_attention_layernorm(hidden_states, adarms_cond)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, **lora_kw)
         hidden_states = _gated_residual(residual, hidden_states, gate)
 
         outputs = (hidden_states,)

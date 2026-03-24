@@ -21,6 +21,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -90,6 +91,11 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Per-task sampling weights. Maps task description substring to weight multiplier.
+    # Tasks matching a substring get upweighted; unmatched tasks get weight 1.0.
+    # Example: {"butter": 3.0, "ketchup": 1.5} oversamples butter 3x, ketchup 1.5x.
+    task_weights: dict[str, float] = dataclasses.field(default_factory=dict)
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -125,17 +131,23 @@ class ModelTransformFactory(GroupFactory):
                 )
             case _model.ModelType.PI05:
                 assert isinstance(model_config, pi0_config.Pi0Config)
-                return _transforms.Group(
-                    inputs=[
-                        _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
-                        _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
-                            discrete_state_input=model_config.discrete_state_input,
-                        ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
-                    ],
-                )
+                tokenizer = _tokenizer.PaligemmaTokenizer(model_config.max_token_len)
+                input_transforms = [
+                    _transforms.InjectDefaultPrompt(self.default_prompt),
+                    _transforms.ResizeImages(224, 224),
+                    _transforms.TokenizePrompt(
+                        tokenizer,
+                        discrete_state_input=model_config.discrete_state_input,
+                    ),
+                    _transforms.PadStatesAndActions(model_config.action_dim),
+                ]
+                # Add audio transforms for audio-enabled models
+                if model_config.audio_enabled:
+                    input_transforms.append(_transforms.AudioPreprocess())
+                    # Pass tokenizer so GenerateASRTargets can tokenize
+                    # original_prompt when clear_prompt=True (Stage 2).
+                    input_transforms.append(_transforms.GenerateASRTargets(tokenizer=tokenizer))
+                return _transforms.Group(inputs=input_transforms)
             case _model.ModelType.PI0_FAST:
                 tokenizer_cls = (
                     _tokenizer.FASTTokenizer
@@ -288,6 +300,22 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
     extra_delta_transform: bool = False
 
+    # Audio settings (optional). When tts_cache_dir is set, AudioTextMixingTransform
+    # will inject TTS audio waveforms into training samples.
+    tts_cache_dir: str = ""
+    # Precomputed Whisper cache dir. When set, loads cached embeddings instead of
+    # running live Whisper (~2x training speedup). Run scripts/precompute_whisper_cache.py first.
+    whisper_cache_dir: str = ""
+    audio_ratio: float = 0.0
+    clear_prompt_for_audio: bool = False
+    # Auxiliary TTS data (optional). When set, with probability auxiliary_ratio
+    # a random prompt+audio from this directory is used instead of matching the
+    # episode's prompt. Useful for mixing in out-of-domain TTS (e.g. DROID) for
+    # acoustic diversity during ASR training.
+    auxiliary_tts_dir: str = ""
+    auxiliary_whisper_cache_dir: str = ""
+    auxiliary_ratio: float = 0.0
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         # The repack transform is *only* applied to the data coming from the dataset,
@@ -318,20 +346,24 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # We defined these transforms in `libero_policy.py`. You can check the detailed comments there for
         # how to modify the transforms to match your dataset. Once you created your own transforms, you can
         # replace the transforms below with your own.
+        data_input_transforms = [libero_policy.LiberoInputs(model_type=model_config.model_type)]
+
+        # Add audio mixing transform when TTS cache is configured.
+        if self.tts_cache_dir:
+            data_input_transforms.append(_transforms.AudioTextMixingTransform(
+                audio_ratio=self.audio_ratio,
+                tts_cache_dir=self.tts_cache_dir,
+                whisper_cache_dir=self.whisper_cache_dir,
+                clear_prompt=self.clear_prompt_for_audio,
+                auxiliary_tts_dir=self.auxiliary_tts_dir,
+                auxiliary_whisper_cache_dir=self.auxiliary_whisper_cache_dir,
+                auxiliary_ratio=self.auxiliary_ratio,
+            ))
+
         data_transforms = _transforms.Group(
-            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+            inputs=data_input_transforms,
             outputs=[libero_policy.LiberoOutputs()],
         )
-
-        # One additional data transform: pi0 models are trained on delta actions (relative to the first
-        # state in each action chunk). IF your data has ``absolute`` actions (e.g. target joint angles)
-        # you can uncomment the following line to convert the actions to delta actions. The only exception
-        # is for the gripper actions which are always absolute.
-        # In the example below, we would apply the delta conversion to the first 6 actions (joints) and
-        # leave the 7th action (gripper) unchanged, i.e. absolute.
-        # In Libero, the raw actions in the dataset are already delta actions, so we *do not* need to
-        # apply a separate delta conversion (that's why it's commented out). Choose whether to apply this
-        # transform based on whether your dataset uses ``absolute`` or ``delta`` actions out of the box.
 
         # LIBERO already represents actions as deltas, but we have some old Pi0 checkpoints that are trained with this
         # extra delta transform.
@@ -492,6 +524,11 @@ class TrainConfig:
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
 
+    # Per-parameter LR scaling. Maps a filter to a gradient scale factor.
+    # E.g., scale=50.0 with base LR 2e-5 gives effective LR 1e-3.
+    # Applied by scaling gradients before the optimizer step.
+    lr_scale_overrides: tyro.conf.Suppress[dict[Filter, float]] = dataclasses.field(default_factory=dict)
+
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
 
@@ -521,6 +558,8 @@ class TrainConfig:
     overwrite: bool = False
     # If true, will resume training from the last checkpoint.
     resume: bool = False
+    # If true, skip loading optimizer state on resume (resets optimizer and step counter).
+    reset_optimizer: bool = False
 
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
@@ -762,6 +801,119 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     #
+    # Audio VLA v2 configs.
+    #
+    # Stage 1: Audio alignment (ASR only, using LIBERO data + TTS audio).
+    # Trains audio projector + attention pooling + audio LoRA on ASR task.
+    # Text kept in prefix for teacher forcing; asr_target_tokens = tokenized_prompt.
+    TrainConfig(
+        name="pi05_audio_stage1",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            audio_enabled=True,
+            paligemma_variant="gemma_2b_split_lora",
+            action_expert_variant="gemma_300m_lora",
+            training_stage="asr_alignment",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            tts_cache_dir="data/tts/libero_train",
+            whisper_cache_dir="data/whisper_cache/libero_train",
+            audio_ratio=1.0,
+            clear_prompt_for_audio=False,
+            # DROID TTS as auxiliary data: 80% of audio samples use DROID prompts+audio
+            # for acoustic/instruction diversity (10k unique prompts, 100k files).
+            auxiliary_tts_dir="data/tts/droid_train",
+            auxiliary_whisper_cache_dir="data/whisper_cache/droid_train",
+            auxiliary_ratio=0.8,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2e-5,
+            decay_steps=30_000,
+            decay_lr=2e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        # Load base Pi0.5 + pretrained Whisper weights.
+        # Whisper weights are still needed for the model init even with cached embeddings,
+        # but won't be used during forward pass when cache is available.
+        weight_loader=weight_loaders.CompositeWeightLoader(
+            loaders=(
+                weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+                weight_loaders.WhisperWeightLoader(),
+            ),
+        ),
+        num_train_steps=30_000,
+        num_workers=0,
+        # Audio projector + attention pooling: effective LR = 2e-5 * 50 = 1e-3
+        # (randomly initialized, needs high LR like VLAS).
+        # Audio LoRA: base LR 2e-5 (scale 1.0, no override needed).
+        lr_scale_overrides={
+            nnx_utils.PathRegex(".*audio_projector.*|.*attention_pooling.*"): 50.0,
+        },
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            audio_enabled=True,
+            paligemma_variant="gemma_2b_split_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+    ),
+    # Stage 2: Robot fine-tuning with split LoRA gradient isolation (JAX).
+    # Task LoRA gets flow matching grads, audio LoRA gets ASR rehearsal grads.
+    TrainConfig(
+        name="pi05_audio_stage2_libero",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            audio_enabled=True,
+            paligemma_variant="gemma_2b_split_lora",
+            action_expert_variant="gemma_300m_lora",
+            training_stage="default",
+            rehearsal_lambda=0.1,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            tts_cache_dir="data/tts/libero_train",
+            whisper_cache_dir="data/whisper_cache/libero_train",
+            audio_ratio=1.0,
+            # Stage 2: clear text prompt so the model must rely on audio for
+            # robot actions.  The original prompt is saved and tokenized
+            # separately for ASR rehearsal targets.
+            clear_prompt_for_audio=True,
+            auxiliary_tts_dir="data/tts/droid_train",
+            auxiliary_whisper_cache_dir="",
+            auxiliary_ratio=0.3,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2e-5,
+            decay_steps=30_000,
+            decay_lr=2e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        # Load from Stage 1 checkpoint (user should update this path).
+        weight_loader=weight_loaders.CheckpointWeightLoader("checkpoints/pi05_audio_stage1/pi05_audio_stage1/29999/params"),
+        num_train_steps=30_000,
+        num_workers=0,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            audio_enabled=True,
+            paligemma_variant="gemma_2b_split_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+    ),
+    #
     # Fine-tuning Aloha configs.
     #
     # This is a test config that is used to illustate how train on a custom LeRobot dataset.
@@ -964,6 +1116,448 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
+    ),
+    # PyTorch audio Stage 1: matches JAX pi05_audio_stage1 but with PyTorch weights.
+    # Base: pi05_libero (LIBERO-finetuned), 80% DROID TTS auxiliary, 30k steps.
+    TrainConfig(
+        name="pi05_audio_stage1_pytorch",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            audio_enabled=True,
+            paligemma_variant="gemma_2b_split_lora",
+            action_expert_variant="gemma_300m_lora",
+            training_stage="asr_alignment",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            tts_cache_dir="data/tts/libero_train",
+            whisper_cache_dir="data/whisper_cache/libero_train",
+            audio_ratio=1.0,
+            clear_prompt_for_audio=False,
+            auxiliary_tts_dir="data/tts/droid_train",
+            auxiliary_whisper_cache_dir="data/whisper_cache/droid_train",
+            auxiliary_ratio=0.8,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2e-5,
+            decay_steps=30_000,
+            decay_lr=2e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,  # Skip EMA for Stage 1; enable in Stage 2 (ema_decay=0.999)
+        num_train_steps=30_000,
+        num_workers=4,
+        pytorch_weight_path="/home/user1/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch",
+    ),
+    # PyTorch audio Stage 1 on H100 — no whisper cache (live Whisper encoder).
+    TrainConfig(
+        name="pi05_audio_stage1_pytorch_h100",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            audio_enabled=True,
+            paligemma_variant="gemma_2b_split_lora",
+            action_expert_variant="gemma_300m_lora",
+            training_stage="asr_alignment",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            tts_cache_dir="data/tts/libero_train",
+            whisper_cache_dir="",  # No cache — run Whisper encoder live
+            audio_ratio=1.0,
+            clear_prompt_for_audio=False,
+            auxiliary_tts_dir="data/tts/droid_train",
+            auxiliary_whisper_cache_dir="",  # No cache
+            auxiliary_ratio=0.8,
+        ),
+        batch_size=96,  # 8 GPUs × 12/GPU (H100 96GB)
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,  # proportional to 1k @ bs=32
+            peak_lr=3.5e-5,  # sqrt scaling from bs=32 (2e-5 × sqrt(96/32) ≈ 3.5e-5)
+            decay_steps=10_000,  # same total samples as 30k @ bs=32
+            decay_lr=3.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=10_000,  # 10k × 96 = 960k samples ≈ 30k × 32
+        num_workers=2,  # reduced from 4 to avoid system RAM OOM with spawn workers
+        pytorch_weight_path="/home/user1/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch",
+    ),
+    # 64-token ablation: same as H100 Stage 1 but audio_num_tokens=64 instead of 32.
+    TrainConfig(
+        name="pi05_audio_stage1_pytorch_h100_64tok",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            audio_enabled=True,
+            audio_num_tokens=64,
+            paligemma_variant="gemma_2b_split_lora",
+            action_expert_variant="gemma_300m_lora",
+            training_stage="asr_alignment",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            tts_cache_dir="data/tts/libero_train",
+            whisper_cache_dir="",  # No cache — must match DROID (live encoding)
+            audio_ratio=1.0,
+            clear_prompt_for_audio=False,
+            auxiliary_tts_dir="data/tts/droid_train",
+            auxiliary_whisper_cache_dir="",  # No cache
+            auxiliary_ratio=0.8,
+        ),
+        batch_size=96,  # 8 GPUs × 12/GPU
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=2.8e-5,  # sqrt scaling from bs=32 (2e-5 × sqrt(64/32) ≈ 2.8e-5)
+            decay_steps=5_000,
+            decay_lr=2.8e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=5_000,
+        num_workers=2,
+        pytorch_weight_path="/home/user1/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch",
+    ),
+    # 64-token Stage 1 continuation on L40S — resume from H100 64-tok ablation (step 5k).
+    TrainConfig(
+        name="pi05_audio_stage1_pytorch_64tok_l40s",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            audio_enabled=True,
+            audio_num_tokens=64,
+            paligemma_variant="gemma_2b_split_lora",
+            action_expert_variant="gemma_300m_lora",
+            training_stage="asr_alignment",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            tts_cache_dir="data/tts/libero_train",
+            whisper_cache_dir="",
+            audio_ratio=1.0,
+            clear_prompt_for_audio=False,
+            auxiliary_tts_dir="data/tts/droid_train",
+            auxiliary_whisper_cache_dir="",
+            auxiliary_ratio=0.8,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=2e-5,
+            decay_steps=5_000,
+            decay_lr=2e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=5_000,
+        num_workers=4,
+        pytorch_weight_path="/home/user1/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch",
+    ),
+    # Stage 2: Robot fine-tuning on H100 with split LoRA gradient isolation (PyTorch).
+    # Task LoRA gets flow matching grads, audio LoRA gets ASR rehearsal grads.
+    TrainConfig(
+        name="pi05_audio_stage2_pytorch_h100",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            audio_enabled=True,
+            paligemma_variant="gemma_2b_split_lora",
+            action_expert_variant="gemma_300m_lora",
+            training_stage="default",
+            rehearsal_lambda=0.1,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            tts_cache_dir="data/tts/libero_train",
+            whisper_cache_dir="",  # No cache — live Whisper encoder
+            audio_ratio=1.0,
+            clear_prompt_for_audio=True,
+            auxiliary_tts_dir="data/tts/droid_train",
+            auxiliary_whisper_cache_dir="",
+            auxiliary_ratio=0.3,
+        ),
+        batch_size=64,  # 8/GPU — dual backward (flow + ASR) needs ~2× memory vs Stage 1
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=300,
+            peak_lr=2.8e-5,
+            decay_steps=5_000,
+            decay_lr=2.8e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=5_000,
+        num_workers=2,
+        pytorch_weight_path="checkpoints/pi05_audio_stage1_pytorch_h100/stage1_h100_bs96/10000",
+    ),
+    # Stage 3: Distillation from text oracle.
+    # Resume from stage2_14000, add L_distill = MSE(v_student, v_teacher) where
+    # teacher = base weights only (LoRA bypassed = text oracle).
+    # IMPORTANT: auxiliary_ratio=0 because DROID auxiliary swaps the prompt text
+    # to a random DROID instruction while keeping LIBERO actions — the teacher
+    # would get mismatched text/actions and produce garbage velocity targets.
+    # LIBERO-only data ensures text prompt always matches the demonstrated actions.
+    TrainConfig(
+        name="pi05_audio_stage3_distill_h100",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            audio_enabled=True,
+            paligemma_variant="gemma_2b_split_lora",
+            action_expert_variant="gemma_300m_lora",
+            training_stage="default",
+            rehearsal_lambda=0.1,
+            distill_lambda=1.0,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            tts_cache_dir="data/tts/libero_train",
+            whisper_cache_dir="",  # No cache — live Whisper encoder
+            audio_ratio=1.0,
+            clear_prompt_for_audio=True,
+            # No DROID auxiliary — distillation requires text-action alignment
+            auxiliary_tts_dir="",
+            auxiliary_whisper_cache_dir="",
+            auxiliary_ratio=0.0,
+        ),
+        batch_size=48,  # Reduced from 64: triple backward (flow + distill + ASR)
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=1e-5,  # Lower LR for fine-tuning from existing Stage 2
+            decay_steps=5_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=5_000,
+        save_interval=1_000,
+        num_workers=2,
+        # Resume from the stage2_14000 checkpoint
+        pytorch_weight_path="checkpoints/pi05_audio_stage2_pytorch_h100/stage2_h100/14000",
+    ),
+    # 64-token Stage 3 distill — skip Stage 2, distill directly from Stage 1.
+    # Base Pi0.5-libero already knows robot actions; Stage 1 taught audio understanding.
+    # Distillation aligns audio-conditioned flow → text oracle flow.
+    TrainConfig(
+        name="pi05_audio_stage3_distill_h100_64tok",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            audio_enabled=True,
+            audio_num_tokens=64,
+            paligemma_variant="gemma_2b_split_lora",
+            action_expert_variant="gemma_300m_lora",
+            training_stage="default",
+            rehearsal_lambda=0.1,
+            distill_lambda=1.0,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            tts_cache_dir="data/tts/libero_train",
+            whisper_cache_dir="",  # No cache — live Whisper encoder
+            audio_ratio=1.0,
+            clear_prompt_for_audio=True,
+            auxiliary_tts_dir="",
+            auxiliary_whisper_cache_dir="",
+            auxiliary_ratio=0.0,
+        ),
+        batch_size=48,  # Triple backward (flow + distill + ASR)
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=1e-5,
+            decay_steps=5_000,
+            decay_lr=1e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=5_000,
+        save_interval=1_000,
+        num_workers=2,
+        # Skip Stage 2 — load directly from 64-tok Stage 1 checkpoint
+        pytorch_weight_path="checkpoints/pi05_audio_stage1_pytorch_h100_64tok/stage1_64tok_ablation/5000",
+    ),
+    # 64-tok Stage 3 v2 — pure distillation (no ASR), stronger distill weight.
+    # Resume from Stage 3 v1 step 3000. Double backward only (flow + distill).
+    TrainConfig(
+        name="pi05_audio_stage3_distill_h100_64tok_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            audio_enabled=True,
+            audio_num_tokens=64,
+            paligemma_variant="gemma_2b_split_lora",
+            action_expert_variant="gemma_300m_lora",
+            training_stage="default",
+            rehearsal_lambda=0.0,
+            distill_lambda=2.0,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            tts_cache_dir="data/tts/libero_train",
+            whisper_cache_dir="",
+            audio_ratio=1.0,
+            clear_prompt_for_audio=True,
+            auxiliary_tts_dir="",
+            auxiliary_whisper_cache_dir="",
+            auxiliary_ratio=0.0,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=5e-6,
+            decay_steps=5_000,
+            decay_lr=5e-7,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=5_000,
+        save_interval=1_000,
+        num_workers=2,
+        pytorch_weight_path="checkpoints/pi05_audio_stage3_distill_h100_64tok/stage3_distill_64tok/3000",
+    ),
+    # PyTorch audio smoke test (keep for quick validation).
+    TrainConfig(
+        name="pi05_audio_stage1_pytorch_test",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            audio_enabled=True,
+            paligemma_variant="gemma_2b_split_lora",
+            action_expert_variant="gemma_300m_lora",
+            training_stage="asr_alignment",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            tts_cache_dir="data/tts/libero_train",
+            whisper_cache_dir="data/whisper_cache/libero_train",
+            audio_ratio=1.0,
+            clear_prompt_for_audio=False,
+        ),
+        batch_size=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5,
+            peak_lr=2e-5,
+            decay_steps=20,
+            decay_lr=2e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        num_train_steps=10,
+        num_workers=0,
+        overwrite=True,
+        exp_name="pytorch_audio_test",
+        wandb_enabled=False,
+        pytorch_weight_path="/home/user1/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch",
+    ),
+    # Stage 1v2: Distill pi0.5-libero (text teacher) → audio pathway.
+    TrainConfig(
+        name="pi05_audio_stage1v2_distill",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            audio_enabled=True,
+            paligemma_variant="gemma_2b_split_lora",
+            action_expert_variant="gemma_300m_lora",
+            training_stage="default",
+            rehearsal_lambda=0.0,
+            distill_lambda=1.0,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            tts_cache_dir="data/tts/libero_train",
+            whisper_cache_dir="",
+            audio_ratio=1.0,
+            clear_prompt_for_audio=True,
+            auxiliary_tts_dir="",
+            auxiliary_whisper_cache_dir="",
+            auxiliary_ratio=0.0,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=1e-4,
+            decay_steps=5_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=5_000,
+        save_interval=1_000,
+        num_workers=2,
+        pytorch_weight_path="/home/user1/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch",
+    ),
+    # Stage 1v2 64tok: Distill with 64 audio tokens
+    TrainConfig(
+        name="pi05_audio_stage1v2_distill_64tok",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            audio_enabled=True,
+            audio_num_tokens=64,
+            paligemma_variant="gemma_2b_split_lora",
+            action_expert_variant="gemma_300m_lora",
+            training_stage="default",
+            rehearsal_lambda=0.0,
+            distill_lambda=1.0,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+            tts_cache_dir="data/tts/libero_train",
+            whisper_cache_dir="",
+            audio_ratio=1.0,
+            clear_prompt_for_audio=True,
+            auxiliary_tts_dir="",
+            auxiliary_whisper_cache_dir="",
+            auxiliary_ratio=0.0,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=1e-4,
+            decay_steps=5_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=5_000,
+        save_interval=1_000,
+        num_workers=2,
+        pytorch_weight_path="/home/user1/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch",
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
